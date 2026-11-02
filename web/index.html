@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>HamClock (WebAssembly)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #8a8; font: 12px monospace; }
+  #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+  canvas { width: 800px; height: 480px; touch-action: none; outline: none; }
+  #status { position: fixed; left: 6px; bottom: 4px; opacity: .7; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="screen" width="800" height="480" tabindex="0"></canvas></div>
+<div id="status">loading…</div>
+<script>
+// Deployment defaults. Edit these for the host serving this page:
+//   DEFAULT_BACKEND_HOST  HamClock's -b argument
+//   DEFAULT_BACKEND_BASE  where the page actually sends backend (/ham/HamClock/...) requests:
+//     '/ohb'              a same-origin proxy prefix, as devserver.py provides
+//     '/'                 this page is served by the backend itself (same origin, no CORS needed)
+//     'https://host'      another server; works only if it sends CORS headers (docs/OHB-BACKEND.md)
+const DEFAULT_BACKEND_HOST = 'ohb.hamclock.app:80';
+const DEFAULT_BACKEND_BASE = '/ohb';
+
+// All overridable in the URL: ?b=host:port  ?backend=/ohb|/|https://host  ?args=extra+hamclock+args
+const params = new URLSearchParams(location.search);
+const BACKEND_HOST = params.get('b') || DEFAULT_BACKEND_HOST;
+let BACKEND_BASE = params.get('backend') || DEFAULT_BACKEND_BASE;
+if (BACKEND_BASE === '/') BACKEND_BASE = location.origin;   // "/" + "/ham/..." would be protocol-relative
+BACKEND_BASE = BACKEND_BASE.replace(/\/+$/, '');
+const APPDIR = '/home/web_user/.hamclock';
+
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+let image = null, appW = 800, appH = 480;
+
+function status(s) { statusEl.textContent = s; }
+
+var Module = {
+  print:    (t) => console.log(t),
+  printErr: (t) => console.warn(t),
+  preRun: [() => {
+    Module.ENV.HC_BACKEND_BASE = BACKEND_BASE;
+  }],
+  onRuntimeInitialized: () => {
+    // persist ~/.hamclock (settings "EEPROM", cached maps) in IndexedDB
+    const FS = Module.FS;
+    FS.mkdirTree(APPDIR);
+    FS.mount(FS.filesystems.IDBFS, {}, APPDIR);
+    FS.syncfs(true, (err) => {
+      if (err) console.warn('IDBFS load', err);
+      status('starting HamClock');
+      // -e/-r/-w -1: no RESTful or Live Web servers (a page can't listen on ports)
+      // -o: log to the console instead of a file
+      // -b: backend, as on the native command line
+      Module.callMain(['-b', BACKEND_HOST, '-e', '-1', '-r', '-1', '-w', '-1', '-o',
+                       ...(params.get('args') ? params.get('args').split(' ') : [])]);
+      Module._hc_input_start();
+      requestAnimationFrame(draw);
+      setInterval(() => FS.syncfs(false, (e) => e && console.warn('IDBFS save', e)), 30000);
+      addEventListener('pagehide', () => FS.syncfs(false, () => {}));
+    });
+  },
+};
+
+// copy the staged framebuffer (0x00RRGGBB words in shared wasm memory) to the canvas, only when
+// HamClock has staged a new frame. Big builds (3200x1920 is 6M pixels) make this matter.
+let lastDraw = 0, lastFrame = -1, dst32 = null;
+function draw(t) {
+  requestAnimationFrame(draw);
+  if (t - lastDraw < 100) return;            // 10 Hz is plenty for a clock
+  lastDraw = t;
+  const ptr = Module._hc_fb_pixels();
+  if (!ptr) return;
+  const frame = Module._hc_fb_frames();
+  if (frame === lastFrame) return;
+  lastFrame = frame;
+  const w = Module._hc_fb_width(), h = Module._hc_fb_height();
+  if (!image || image.width !== w || image.height !== h) {
+    canvas.width = w; canvas.height = h;
+    image = ctx.createImageData(w, h);
+    dst32 = new Uint32Array(image.data.buffer);
+    appW = Module._hc_app_width(); appH = Module._hc_app_height();
+    fitScaling();
+    status('');
+  }
+  // canvas wants bytes R,G,B,A, ie little-endian words 0xAABBGGRR: swap R and B, set alpha
+  const src = new Uint32Array(Module.HEAPU8.buffer, ptr, w * h);
+  for (let i = 0; i < src.length; i++) {
+    const p = src[i];
+    dst32[i] = 0xff000000 | (p & 0x00ff00) | (p >>> 16 & 0xff) | ((p & 0xff) << 16);
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+// fit the whole clock in the window, keeping its shape; crisp pixels when enlarged, smooth when a
+// big build is shown smaller than its native size
+function fitScaling() {
+  const k = Math.min(innerWidth / canvas.width, innerHeight / canvas.height);
+  canvas.style.width = Math.floor(canvas.width * k) + 'px';
+  canvas.style.height = Math.floor(canvas.height * k) + 'px';
+  canvas.style.imageRendering = k * devicePixelRatio >= 1 ? 'pixelated' : 'auto';
+}
+addEventListener('resize', fitScaling);
+
+// input: events go into a lock-free queue in wasm memory (see wasm_glue.cpp); never call
+// HamClock functions that lock from this thread.
+const HCE_MOUSE = 1, HCE_TOUCH = 2, HCE_KEY = 3;
+const NAMED_KEYS = { Escape: 27, Enter: 10, Tab: 9, Delete: 127, Backspace: 8,
+                     ArrowLeft: -1, ArrowDown: -2, ArrowUp: -3, ArrowRight: -4 };
+function event(type, a, b, c) { if (Module._hc_event) Module._hc_event(type, a, b, c); }
+function appXY(e) {
+  const r = canvas.getBoundingClientRect();
+  return [Math.floor((e.clientX - r.left) * appW / r.width),
+          Math.floor((e.clientY - r.top) * appH / r.height)];
+}
+let lastMove = 0;
+canvas.addEventListener('pointermove', (e) => {
+  if (e.timeStamp - lastMove < 50) return;   // plenty for hover tooltips
+  lastMove = e.timeStamp;
+  event(HCE_MOUSE, ...appXY(e), 0);
+});
+canvas.addEventListener('pointerdown', (e) => {
+  canvas.focus();
+  event(HCE_TOUCH, ...appXY(e), e.button > 0 ? 1 : 0);
+  e.preventDefault();
+});
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+canvas.addEventListener('keydown', (e) => {
+  if (e.metaKey) return;
+  let c = NAMED_KEYS[e.key];
+  if (c === undefined && e.key.length === 1) c = e.key.charCodeAt(0);
+  if (c === undefined || c > 126) return;
+  event(HCE_KEY, c, e.ctrlKey ? 1 : 0, e.shiftKey ? 1 : 0);
+  e.preventDefault();
+});
+</script>
+<script src="hamclock.js"></script>
+</body>
+</html>

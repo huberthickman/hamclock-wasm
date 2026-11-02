@@ -1,0 +1,110 @@
+From d16804697f6b138b8a288baf6c5517570d0299ba Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sun, 1 Nov 2026 21:15:43 -0600
+Subject: [PATCH 2/4] Platform stubs for Emscripten builds
+
+- WiFi::status() reports connected: there are no interfaces to enumerate.
+- WiFi::localIP() returns 0.0.0.0 without opening a probe socket.
+- useOSTime() is forced true: no UDP for NTP; the browser clock is synced.
+- main loop uses the min-idle cadence: getrusage() is unavailable, so the
+  CPU throttle controller would read garbage.
+- status line shows "Web browser" instead of a red "No Network" for the
+  local IP slot, and the page's backend base instead of a made-up
+  getaddrinfo() address for the backend IP slot.
+
+All inside #if __EMSCRIPTEN__.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/ArduinoLib/Arduino.cpp     |  4 ++++
+ ESPHamClock/ArduinoLib/ESP8266WiFi.cpp |  8 ++++++++
+ ESPHamClock/ESPHamClock.cpp            | 10 ++++++++++
+ ESPHamClock/setup.cpp                  |  3 +++
+ 4 files changed, 25 insertions(+)
+
+diff --git a/ESPHamClock/ArduinoLib/Arduino.cpp b/ESPHamClock/ArduinoLib/Arduino.cpp
+index 8aa2624..a190c6b 100644
+--- a/ESPHamClock/ArduinoLib/Arduino.cpp
++++ b/ESPHamClock/ArduinoLib/Arduino.cpp
+@@ -740,6 +740,10 @@ int hamclock_main (int ac, char *av[])
+ 
+     #define TVUSEC(tv0,tv1) (((tv1).tv_sec-(tv0).tv_sec)*1000000 + ((tv1).tv_usec-(tv0).tv_usec))
+ 
++#if defined(__EMSCRIPTEN__)
++    // browser: no getrusage() to throttle with; the minimum idle cadence keeps the worker polite
++    max_cpu_usage = 1;
++#endif
+     if (max_cpu_usage == 1) {
+ 
+         // pure loop, but still yield briefly when loop() returns faster than our minimum idle cadence.
+diff --git a/ESPHamClock/ArduinoLib/ESP8266WiFi.cpp b/ESPHamClock/ArduinoLib/ESP8266WiFi.cpp
+index 4196dda..614c64b 100644
+--- a/ESPHamClock/ArduinoLib/ESP8266WiFi.cpp
++++ b/ESPHamClock/ArduinoLib/ESP8266WiFi.cpp
+@@ -133,6 +133,10 @@ IPAddress WiFi::localIP(void)
+ {
+ 	static IPAddress a;                     // cache once found
+ 
++#if defined(__EMSCRIPTEN__)
++        return (a);                             // browser: no local IP to discover, and no raw sockets
++#endif
++
+         // try cache first
+         if (a[0] != 0)
+             return (a);
+@@ -412,6 +416,10 @@ bool WiFi::RSSI(int &value, bool &is_dbm)
+ 
+ int WiFi::status(void)
+ {
++#if defined(__EMSCRIPTEN__)
++        // browser: no interfaces to enumerate; if the page loaded, we have a network
++        return (WL_CONNECTED);
++#endif
+ 	// get list of all interfaces
+ 	struct ifaddrs *ifp0;
+ 	if (getifaddrs(&ifp0) < 0) {
+diff --git a/ESPHamClock/ESPHamClock.cpp b/ESPHamClock/ESPHamClock.cpp
+index 8ee47f6..6c285d4 100644
+--- a/ESPHamClock/ESPHamClock.cpp
++++ b/ESPHamClock/ESPHamClock.cpp
+@@ -1546,6 +1546,11 @@ static void drawRotatingMessage(bool force)
+ 
+         case ROTM_LIP: {
+ 
++#if defined(__EMSCRIPTEN__)
++            // browser: pages can not learn their local IP; say where we are instead of "No Network"
++            strcpy (str, "Web browser");
++            break;
++#endif
+             IPAddress ip = WiFi.localIP();
+             bool net_ok = ip[0] != '\0';
+             if (net_ok) {
+@@ -1611,6 +1616,11 @@ static void drawRotatingMessage(bool force)
+             break;
+ 
+         case ROTM_BEIP: {
++#if defined(__EMSCRIPTEN__)
++            // browser: getaddrinfo() returns made-up addresses, and the page fetches via its own origin
++            strcpy (str, getenv("HC_BACKEND_BASE") ? getenv("HC_BACKEND_BASE") : "BE via browser");
++            break;
++#endif
+             if (backend_host[0]) {
+                 struct addrinfo hints, *res;
+                 memset(&hints, 0, sizeof(hints));
+diff --git a/ESPHamClock/setup.cpp b/ESPHamClock/setup.cpp
+index 347a333..d770eee 100644
+--- a/ESPHamClock/setup.cpp
++++ b/ESPHamClock/setup.cpp
+@@ -6336,6 +6336,9 @@ bool useLocalNTPHost()
+  */
+ bool useOSTime()
+ {
++#if defined(__EMSCRIPTEN__)
++    return (true);              // browser: no UDP for NTP; the browser clock is already synced
++#endif
+     return (strcmp (getEntangledValue (NTPA_BPR, NTPB_BPR), ntp_sn[NTPSC_OS]) == 0);
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,70 @@
+From 7390edec44131b92880f7031c5f922b46956f04c Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sun, 1 Nov 2026 21:15:43 -0600
+Subject: [PATCH 4/4] Makefile: add hamclock-wasm target
+
+  make hamclock-wasm CXX=em++ CC=emcc AR=emar RANLIB=emranlib [WASM_SIZE=1600x960]
+
+Builds the _WEB_ONLY variant for the browser with -sPROXY_TO_PTHREAD so all
+of HamClock runs in a Web Worker where blocking network reads are allowed.
+WASM_SIZE selects 800x480 (default), 1600x960, 2400x1440 or 3200x1920.
+Because objects do not record their build size, the tree is cleaned
+automatically when the size changes or after a native build (.wasm-size).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/Makefile | 33 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/ESPHamClock/Makefile b/ESPHamClock/Makefile
+index ce2dd95..804f6c4 100644
+--- a/ESPHamClock/Makefile
++++ b/ESPHamClock/Makefile
+@@ -354,12 +354,43 @@ install:
+ 		&& chmod u+s $$TARGET; \
+ 	fi
+ 
++# browser (WebAssembly) version of the web-only build. Requires Emscripten; build with
++#   make hamclock-wasm CXX=em++ CC=emcc AR=emar RANLIB=emranlib [WASM_SIZE=1600x960]
++# WASM_SIZE is 800x480 (default), 1600x960, 2400x1440 or 3200x1920, like the native sizes.
++# Output is wasm/hamclock.{js,wasm,worker.js}; it needs a host page (index.html) and must be served
++# with COOP/COEP headers so SharedArrayBuffer works. See the hamclock-wasm project for both.
++# PROXY_TO_PTHREAD runs all of HamClock in a Web Worker so its blocking network reads work.
++WASM_SIZE ?= 800x480
++WASM_LDFLAGS = -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=16 -sALLOW_MEMORY_GROWTH=1 \
++	-sINITIAL_MEMORY=268435456 -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 \
++	-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -lidbfs.js \
++	-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,UTF8ToString,stringToNewUTF8,callMain,ENV \
++	-sEXPORTED_FUNCTIONS=_main,_malloc,_free
++
++ifneq ($(filter hamclock-wasm,$(MAKECMDGOALS)),)
++    ifeq ($(filter $(WASM_SIZE),800x480 1600x960 2400x1440 3200x1920),)
++        $(error WASM_SIZE must be 800x480, 1600x960, 2400x1440 or 3200x1920)
++    endif
++    # objects don't record the size or target they were built for, so start clean whenever the
++    # size changes or the tree was last built natively (no .wasm-size yet)
++    ifneq ($(shell cat .wasm-size 2>/dev/null),$(WASM_SIZE))
++        $(info hamclock-wasm: new size $(WASM_SIZE), cleaning first)
++        $(shell $(MAKE) --no-print-directory clean >/dev/null 2>&1; echo $(WASM_SIZE) > .wasm-size)
++    endif
++endif
++
++hamclock-wasm: CXXFLAGS+=-D_WEB_ONLY $(if $(filter-out 800x480,$(WASM_SIZE)),-D_CLOCK_$(WASM_SIZE))
++hamclock-wasm: $(OBJS) wasm_glue.o hclibs
++	mkdir -p wasm
++	$(CXX) $(LDXXFLAGS) $(OBJS) wasm_glue.o -o wasm/hamclock.js $(LIBS) $(WASM_LDFLAGS)
++	@echo "built wasm/hamclock.js for $(WASM_SIZE)"
++
+ clean clobber:
+ 	$(MAKE) -C ArduinoLib clean
+ 	$(MAKE) -C wsServer clean
+ 	$(MAKE) -C zlib-hc clean
+ 	touch x.o x.dSYM hamclock hamclock-
+-	rm -rf *.o *.dSYM hamclock hamclock-*
++	rm -rf *.o *.dSYM hamclock hamclock-* .wasm-size
+ 
+ 
+ .PHONY: test test-eeprom
+-- 
+2.43.0
+

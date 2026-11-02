@@ -1,0 +1,213 @@
+From ffa8a3282f867ff548d1699e5a777e13ab575651 Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sun, 1 Nov 2026 21:15:43 -0600
+Subject: [PATCH 3/4] Expose web-only framebuffer and input to a browser host
+ page
+
+The _WEB_ONLY build already renders into an in-memory stage buffer for
+Live Web. wasm_glue.cpp exports its address and geometry so the host page
+can blit it to a <canvas> straight from shared wasm memory, plus a frame
+counter (bumped by fbThread) so the page redraws only when something new
+was staged.
+
+Input: the page must never call functions that take HamClock mutexes from
+the browser main thread (a worker holding one may be waiting on a call
+proxied to that thread, which deadlocks). So the page appends events to a
+lock-free single-producer queue and an input thread drains it, doing the
+same as liveweb.cpp setLiveTouch()/setLiveMouse()/setLiveChar().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/ArduinoLib/Adafruit_RA8875.cpp |  17 ++++
+ ESPHamClock/ArduinoLib/Adafruit_RA8875.h   |   7 ++
+ ESPHamClock/wasm_glue.cpp                  | 111 +++++++++++++++++++++
+ 3 files changed, 135 insertions(+)
+ create mode 100644 ESPHamClock/wasm_glue.cpp
+
+diff --git a/ESPHamClock/ArduinoLib/Adafruit_RA8875.cpp b/ESPHamClock/ArduinoLib/Adafruit_RA8875.cpp
+index 4b6c373..e6ea600 100644
+--- a/ESPHamClock/ArduinoLib/Adafruit_RA8875.cpp
++++ b/ESPHamClock/ArduinoLib/Adafruit_RA8875.cpp
+@@ -40,6 +40,10 @@
+ 
+ #include "Adafruit_RA8875.h"
+ 
++#if defined(__EMSCRIPTEN__)
++extern volatile uint32_t wasm_frames;           // count of staged frames, read by the page
++#endif
++
+ 
+ #ifdef _USE_FB0
+ 
+@@ -50,6 +54,7 @@
+ #include <stdarg.h>
+ #include <sys/wait.h>
+ 
++
+ /* fork/exec /bin/sh to run command
+  */
+ static void ourSystem (const char *fmt, ...)
+@@ -2559,6 +2564,9 @@ void Adafruit_RA8875::fbThread ()
+                     drawCanvas();
+                     fb_dirty = false;
+                     pr_draw = false;
++#if defined(__EMSCRIPTEN__)
++                    wasm_frames++;              // tells the page there is something new to show
++#endif
+                 }
+             pthread_mutex_unlock (&fb_lock);
+ 
+@@ -2590,6 +2598,15 @@ void Adafruit_RA8875::drawCanvas()
+         }
+ }
+ 
++#if defined(__EMSCRIPTEN__)
++// _WEB_ONLY browser build accessors, see wasm_glue.cpp
++volatile uint32_t wasm_frames;
++const void *Adafruit_RA8875::wasmStage(void) { return (fb_stage); }
++int Adafruit_RA8875::wasmStageW(void) { return (FB_XRES); }
++int Adafruit_RA8875::wasmStageH(void) { return (FB_YRES); }
++int Adafruit_RA8875::wasmStageBPP(void) { return (BYTESPFBPIX); }
++#endif
++
+ // _WEB_ONLY
+ void Adafruit_RA8875::X11OptionsEngageNow (bool fs)
+ {
+diff --git a/ESPHamClock/ArduinoLib/Adafruit_RA8875.h b/ESPHamClock/ArduinoLib/Adafruit_RA8875.h
+index f064ab9..652b5a8 100644
+--- a/ESPHamClock/ArduinoLib/Adafruit_RA8875.h
++++ b/ESPHamClock/ArduinoLib/Adafruit_RA8875.h
+@@ -190,6 +190,13 @@ class Adafruit_RA8875 {
+         // set and get current mouse position
+         bool getMouse (uint16_t *x, uint16_t *y);
+         void setMouse (int x, int y);
++#if defined(__EMSCRIPTEN__) && defined(_WEB_ONLY)
++        // browser build: the page reads the staged 0x00RRGGBB pixels straight out of shared wasm memory
++        const void *wasmStage(void);
++        int wasmStageW(void);
++        int wasmStageH(void);
++        int wasmStageBPP(void);
++#endif
+         bool warpCursor (char dir, unsigned n, int *xp, int *yp);
+ 
+         // set mmap'ed location and size of day and night images, size in units of uint16_t
+diff --git a/ESPHamClock/wasm_glue.cpp b/ESPHamClock/wasm_glue.cpp
+new file mode 100644
+index 0000000..acc4e63
+--- /dev/null
++++ b/ESPHamClock/wasm_glue.cpp
+@@ -0,0 +1,111 @@
++/* wasm_glue.cpp: entry points the browser page calls to drive the _WEB_ONLY HamClock build.
++ *
++ * HamClock itself runs in a Web Worker (linked with -sPROXY_TO_PTHREAD). The page, on the
++ * browser main thread, reads pixels directly from the shared wasm memory.
++ *
++ * Input must not call into HamClock from the browser main thread: setMouse() and putChar() take
++ * mutexes that HamClock threads may hold while waiting on a call proxied to that same main thread,
++ * which deadlocks. So the page only appends events to a lock-free single-producer queue in shared
++ * memory, and an input thread here drains it and does exactly what liveweb.cpp does for a Live
++ * Web client.
++ */
++
++#if defined(__EMSCRIPTEN__)
++
++#include <atomic>
++#include <emscripten.h>
++#include "HamClock.h"
++
++enum { HCE_MOUSE = 1, HCE_TOUCH = 2, HCE_KEY = 3 };
++
++typedef struct {
++    int type, a, b, c;
++} HCEvent;
++
++#define HCE_N 256
++static HCEvent evq[HCE_N];
++static std::atomic<int> ev_head;                // next to read, written only by input thread
++static std::atomic<int> ev_tail;                // next to write, written only by page
++
++static void dispatch (const HCEvent &e)
++{
++    switch (e.type) {
++
++    case HCE_MOUSE:                             // a,b: app x,y
++        tft.setMouse (e.a, e.b);
++        break;
++
++    case HCE_TOUCH:                             // a,b: app x,y; c: 0 primary else other button
++        if (e.a < 0 || e.a >= tft.width() || e.b < 0 || e.b >= tft.height())
++            break;
++        tft.setMouse (e.a, e.b);
++        wifi_tt_s.x = e.a;
++        wifi_tt_s.y = e.b;
++        wifi_tt_live = true;                    // N.B. before wifi_tt, see liveweb.cpp
++        wifi_tt = e.c ? TT_TAP_BX : TT_TAP;
++        break;
++
++    case HCE_KEY:                               // a: HamClock char (see CHAR_* in ArduinoLib.h)
++        tft.putChar ((char)e.a, e.b != 0, e.c != 0);
++        break;
++    }
++}
++
++static void *inputThread (void *unused)
++{
++    (void) unused;
++    for (;;) {
++        int h = ev_head.load (std::memory_order_relaxed);
++        while (h != ev_tail.load (std::memory_order_acquire)) {
++            dispatch (evq[h]);
++            h = (h + 1) % HCE_N;
++            ev_head.store (h, std::memory_order_release);
++        }
++        usleep (10000);
++    }
++    return (NULL);
++}
++
++extern "C" {
++
++// framebuffer geometry and location of the staged pixels, 0x00RRGGBB per pixel when bpp is 4.
++// pixels is NULL until HamClock has initialized the display.
++EMSCRIPTEN_KEEPALIVE const void *hc_fb_pixels (void) { return (tft.wasmStage()); }
++EMSCRIPTEN_KEEPALIVE int hc_fb_width (void)         { return (tft.wasmStageW()); }
++EMSCRIPTEN_KEEPALIVE int hc_fb_height (void)        { return (tft.wasmStageH()); }
++EMSCRIPTEN_KEEPALIVE int hc_fb_bpp (void)           { return (tft.wasmStageBPP()); }
++
++// increments each time new pixels are staged, so the page can skip redrawing unchanged frames
++extern volatile uint32_t wasm_frames;
++EMSCRIPTEN_KEEPALIVE uint32_t hc_fb_frames (void)   { return (wasm_frames); }
++
++// app coordinate size, ie, what touch and mouse coordinates are in
++EMSCRIPTEN_KEEPALIVE int hc_app_width (void)        { return (tft.width()); }
++EMSCRIPTEN_KEEPALIVE int hc_app_height (void)       { return (tft.height()); }
++
++// start the input thread; call once from the page after callMain()
++EMSCRIPTEN_KEEPALIVE void hc_input_start (void)
++{
++    pthread_t tid;
++    if (pthread_create (&tid, NULL, inputThread, NULL) == 0)
++        pthread_detach (tid);
++}
++
++// queue an input event, never blocks. return 0 if the queue is full.
++EMSCRIPTEN_KEEPALIVE int hc_event (int type, int a, int b, int c)
++{
++    int t = ev_tail.load (std::memory_order_relaxed);
++    int nt = (t + 1) % HCE_N;
++    if (nt == ev_head.load (std::memory_order_acquire))
++        return (0);
++    evq[t].type = type;
++    evq[t].a = a;
++    evq[t].b = b;
++    evq[t].c = c;
++    ev_tail.store (nt, std::memory_order_release);
++    return (1);
++}
++
++} // extern "C"
++
++#endif // __EMSCRIPTEN__
+-- 
+2.43.0
+
