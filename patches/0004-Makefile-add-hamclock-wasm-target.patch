@@ -1,26 +1,28 @@
-From 7390edec44131b92880f7031c5f922b46956f04c Mon Sep 17 00:00:00 2001
+From 8b19f803c294fe0c5d25ea138cef302e28da043f Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
-Date: Sun, 1 Nov 2026 21:15:43 -0600
+Date: Sun, 1 Nov 2026 23:41:50 -0600
 Subject: [PATCH 4/4] Makefile: add hamclock-wasm target
 
   make hamclock-wasm CXX=em++ CC=emcc AR=emar RANLIB=emranlib [WASM_SIZE=1600x960]
 
 Builds the _WEB_ONLY variant for the browser with -sPROXY_TO_PTHREAD so all
-of HamClock runs in a Web Worker where blocking network reads are allowed.
+of HamClock runs in a Web Worker where blocking network reads are allowed,
+and -sFETCH for the Emscripten Fetch API WiFiClient uses (its IndexedDB
+support is turned off: HamClock keeps its own cache).
 WASM_SIZE selects 800x480 (default), 1600x960, 2400x1440 or 3200x1920.
 Because objects do not record their build size, the tree is cleaned
 automatically when the size changes or after a native build (.wasm-size).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- ESPHamClock/Makefile | 33 ++++++++++++++++++++++++++++++++-
- 1 file changed, 32 insertions(+), 1 deletion(-)
+ ESPHamClock/Makefile | 35 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
 
 diff --git a/ESPHamClock/Makefile b/ESPHamClock/Makefile
-index ce2dd95..804f6c4 100644
+index ce2dd95..39e36f2 100644
 --- a/ESPHamClock/Makefile
 +++ b/ESPHamClock/Makefile
-@@ -354,12 +354,43 @@ install:
+@@ -354,12 +354,45 @@ install:
  		&& chmod u+s $$TARGET; \
  	fi
  
@@ -30,10 +32,12 @@ index ce2dd95..804f6c4 100644
 +# Output is wasm/hamclock.{js,wasm,worker.js}; it needs a host page (index.html) and must be served
 +# with COOP/COEP headers so SharedArrayBuffer works. See the hamclock-wasm project for both.
 +# PROXY_TO_PTHREAD runs all of HamClock in a Web Worker so its blocking network reads work.
++# FETCH is Emscripten's Fetch API, which WiFiClient uses for HTTP; its IndexedDB cache is not
++# needed because HamClock keeps its own in ~/.hamclock.
 +WASM_SIZE ?= 800x480
 +WASM_LDFLAGS = -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=16 -sALLOW_MEMORY_GROWTH=1 \
 +	-sINITIAL_MEMORY=268435456 -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 \
-+	-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -lidbfs.js \
++	-sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -lidbfs.js -sFETCH -sFETCH_SUPPORT_INDEXEDDB=0 \
 +	-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,UTF8ToString,stringToNewUTF8,callMain,ENV \
 +	-sEXPORTED_FUNCTIONS=_main,_malloc,_free
 +
