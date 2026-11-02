@@ -2,3 +2,9 @@ build/
 dist/
 __pycache__/
 .DS_Store
+
+# Markdown previews (Positron/Quarto)
+/README.html
+/README_files/
+/docs/*.html
+/docs/*_files/

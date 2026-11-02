@@ -63,14 +63,21 @@ In `__EMSCRIPTEN__` builds:
    `raw TCP is not available in the browser build` and fail, so the DX cluster and similar
    features degrade the way they do when a host is unreachable.
 2. `write()` collects the request text.
-3. The first `available()` or `read()` performs it. JavaScript (via `EM_JS`) reads the request
-   line and headers and builds a URL. If the host is `backend_host` and `HC_BACKEND_BASE` is set,
-   the base replaces `http://host`. The request is sent with a **synchronous**
-   `XMLHttpRequest` (`responseType = 'arraybuffer'`), which is legal in a worker.
-4. The reply is rebuilt as `HTTP/1.0 <status>` plus the response headers the browser exposes,
-   a correct `Content-Length` (the browser has already undone any compression) and the body.
-   It's then drained through the existing read-ahead buffer. When the buffer is exhausted the
-   client closes itself, just like EOF on a socket.
+3. The first `available()` or `read()` performs it. The C++ reads the request line and headers
+   and builds a URL. If the host is `backend_host` and `HC_BACKEND_BASE` is set, the base replaces
+   `http://host`. The request goes through Emscripten's
+   [Fetch API](https://emscripten.org/docs/api_reference/fetch.html): `emscripten_fetch()` with
+   `EMSCRIPTEN_FETCH_SYNCHRONOUS | EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_REPLACE`.
+   Underneath, that's a synchronous `XMLHttpRequest`, which browsers allow only off the main
+   thread, so it works because HamClock runs in a worker. `REPLACE` skips the Fetch API's own
+   IndexedDB cache, and the build turns that cache off entirely (`-sFETCH_SUPPORT_INDEXEDDB=0`),
+   because HamClock keeps its own cache in `~/.hamclock`.
+4. The reply is rebuilt as `HTTP/1.0 <status>` (from `fetch->status` and `statusText`), the
+   response headers the browser exposes (`emscripten_fetch_get_response_headers()`), a correct
+   `Content-Length` (the browser has already undone any compression) and the body
+   (`fetch->data`). It's then drained through the existing read-ahead buffer. When the buffer is
+   exhausted the client closes itself, just like EOF on a socket.
+
 
 The few request headers that matter are carried over:
 
@@ -84,8 +91,16 @@ That means a cross-origin backend doesn't need `Access-Control-Expose-Headers`.
 `connectCommand()` (the curl pipe that `connecthttpsHCGET()` and `hamsat.cpp` use for HTTPS) pulls
 the URL out of the command, fetches it the same way, and returns only the body, as curl does.
 
-Failures (network error, CORS refusal, an unreachable host) come back as a failed read. HamClock
-then shows the same "download failed" or "data invalid" messages it shows natively.
+Failures come back as a failed read: a network error, a CORS refusal or an unreachable host, all
+of which the browser reports as status 0. HamClock then shows the same "download failed" or
+"data invalid" messages it shows natively. HTTP errors such as 404 aren't failures at this
+level. They reach HamClock with their status, as they would natively.
+
+**Timeouts.** The native client gives up connecting after 8 seconds. Browsers don't allow a
+timeout on a synchronous request, and the Fetch API's `timeoutMSecs` only applies to asynchronous
+ones. `emscripten_fetch_wait()` with a timeout looks like an alternative, but in Emscripten 3.1.51
+it returns an error immediately for a request already in progress. So a server that accepts the
+connection but never answers holds that HamClock thread until the browser itself gives up.
 
 ## Display (patch 0003)
 
@@ -147,7 +162,7 @@ Emscripten generates the other three on every build.
 | File | Size | What it is |
 |---|---|---|
 | `hamclock.wasm` | 1.7 to 1.9 MB stripped, 9 to 10 MB with `-g` | HamClock itself: all the compiled C++ |
-| `hamclock.js` | about 220 KB (55 KB gzipped) | Emscripten's generated JavaScript "glue", explained below |
+| `hamclock.js` | about 225 KB (55 KB gzipped) | Emscripten's generated JavaScript "glue", explained below |
 | `hamclock.worker.js` | about 7 KB | Startup script each Web Worker runs first: it loads `hamclock.js` inside the worker and attaches it to the shared memory. Only needed up to Emscripten 3.1.57: from 3.1.58 the worker code is inside `hamclock.js` and this file is an empty placeholder, and from 3.1.68 it isn't generated at all |
 | `index.html` | | The host page: canvas drawing, input, storage setup, configuration |
 | `devserver.py` | | Local server with the COOP/COEP headers and the `/ohb` proxy |
@@ -171,15 +186,15 @@ print. `hamclock.js` supplies all of that:
 - **Runs the threads.** It creates the Web Workers that `main()` and HamClock's pthreads run in,
   and keeps a pool of them ready. When a worker needs something only the main thread can do,
   such as a file-system operation, it passes the call over to the main thread and waits.
-- **Contains the network code.** The `EM_JS` functions in patch 0001 (the synchronous XHR that
-  sends HamClock's requests, with `X-HamClock-UA`) are copied into `hamclock.js` at build time.
-  The C++ calls them like ordinary functions.
+- **Includes the Fetch API.** `emscripten_fetch()`, which patch 0001 calls from C++, is implemented
+  in JavaScript here: it creates the `XMLHttpRequest`, sets the request headers, and copies the
+  response into wasm memory.
 - **Exposes the API the page uses.** `Module.callMain`, `Module.FS`, `Module.HEAPU8`,
   `Module.ENV`, and the exported C functions such as `Module._hc_fb_pixels`,
   `Module._hc_fb_frames` and `Module._hc_event`.
 
 Never edit `hamclock.js`, because the next build overwrites it. Changes go in the C++ (the
-`EM_JS` code lives in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makefile, or
+request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makefile, or
 `web/index.html`.
 
 ## The host page (web/index.html)
@@ -201,11 +216,12 @@ Never edit `hamclock.js`, because the next build overwrites it. Changes go in th
 | `-sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=2MB` | HamClock puts large buffers on the stack; Emscripten's default is 64 KB |
 | `-sEXIT_RUNTIME=0 -sINVOKE_RUN=0` | The page decides when `main()` runs |
 | `-lidbfs.js` | Persistent `~/.hamclock` |
+| `-sFETCH -sFETCH_SUPPORT_INDEXEDDB=0` | Emscripten's Fetch API for `WiFiClient`, without its IndexedDB cache |
 | `-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,…` | What `index.html` uses |
 
 Sizes with Emscripten 3.1.51 and LLVM 18: the wasm is 9 to 10 MB with HamClock's default `-g`.
 After `wasm-opt --strip-debug -O2` it's 1.7 MB (800x480) to 1.9 MB (1600x960), or about
-625 KB gzipped at 800x480. The JavaScript glue is about 220 KB, 55 KB gzipped.
+625 KB gzipped at 800x480. The JavaScript glue is about 225 KB, 55 KB gzipped.
 
 ## Sizes
 
