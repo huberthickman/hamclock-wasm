@@ -106,6 +106,7 @@ var Module = {
                        ...(params.get('args') ? params.get('args').split(' ') : []),
                        ...restartArgs]);
       Module._hc_input_start();
+      running = true;
       setInterval(() => { pollURL(); pollRestart(); }, 100);
       requestAnimationFrame(draw);
       setInterval(() => FS.syncfs(false, (e) => e && console.warn('IDBFS save', e)), 30000);
@@ -159,7 +160,10 @@ addEventListener('resize', fitScaling);
 const HCE_MOUSE = 1, HCE_TOUCH = 2, HCE_KEY = 3;
 const NAMED_KEYS = { Escape: 27, Enter: 10, Tab: 9, Delete: 127, Backspace: 8,
                      ArrowLeft: -1, ArrowDown: -2, ArrowUp: -3, ArrowRight: -4 };
-function event(type, a, b, c) { if (Module._hc_event) Module._hc_event(type, a, b, c); }
+// input before HamClock is running is dropped: the exported functions exist before the runtime
+// is ready, and calling one then aborts the whole program
+let running = false;
+function event(type, a, b, c) { if (running) Module._hc_event(type, a, b, c); }
 function appXY(e) {
   const r = canvas.getBoundingClientRect();
   return [Math.floor((e.clientX - r.left) * appW / r.width),

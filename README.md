@@ -50,6 +50,17 @@ scripts/build.sh 1600x960             # or 800x480, 2400x1440, 3200x1920; STRIP=
 python3 dist/1600x960/devserver.py    # then open http://localhost:8000/
 ```
 
+To build every size at once, for example for a release:
+
+```sh
+STRIP=1 PACKAGE=1 scripts/build_all.sh    # or name sizes: scripts/build_all.sh 800x480 1600x960
+```
+
+This runs `build.sh` once per size. Each size is a full rebuild, so allow a few minutes each. With
+`PACKAGE=1` it also zips each size as `dist/hamclock-wasm-<version>-<size>.zip`, named from the
+repo's tag (override with `VERSION=`). Anyone who downloads a zip still needs to run
+`python3 devserver.py` from inside it: opening `index.html` directly won't work.
+
 `build.sh` clones upstream at the pinned commit, applies `patches/`, builds and copies the page
 into `dist/<size>/`. `devserver.py` serves it with the headers the browser needs and forwards
 `/ohb/*` to `http://ohb.hamclock.app`.
@@ -154,7 +165,8 @@ hamclock-wasm/
 │   ├── index.html              host page: canvas, input, links, storage, configuration
 │   └── devserver.py            local server: COOP/COEP headers + /ohb proxy (stdlib only)
 ├── scripts/
-│   └── build.sh                clone upstream, apply patches, build, collect dist/<size>/
+│   ├── build.sh                clone upstream, apply patches, build, collect dist/<size>/
+│   └── build_all.sh            build.sh for every size, optionally zipped for a release
 └── docs/
     ├── DESIGN.md               how it works, build flags, limitations
     ├── OHB-BACKEND.md          what a browser client needs from an OHB server
