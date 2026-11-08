@@ -28,6 +28,16 @@ case "$SIZE" in
 esac
 command -v em++ >/dev/null || { echo "em++ not found: install emsdk and source emsdk_env.sh" >&2; exit 1; }
 
+# STRIP=1 needs wasm-opt. emsdk_env.sh doesn't put it on PATH; ask Emscripten where Binaryen is.
+# Checked now rather than after a long build.
+if [ "${STRIP:-0}" = 1 ]; then
+    WASM_OPT="$(command -v wasm-opt || true)"
+    if [ -z "$WASM_OPT" ]; then
+        WASM_OPT="$(em-config BINARYEN_ROOT 2>/dev/null)/bin/wasm-opt"
+    fi
+    [ -x "$WASM_OPT" ] || { echo "STRIP=1: wasm-opt not found (emsdk keeps it in upstream/bin)" >&2; exit 1; }
+fi
+
 # fresh upstream tree at the pinned commit, with the patch series applied
 if [ ! -d "$SRC/.git" ]; then
     mkdir -p "$ROOT/build"
@@ -58,7 +68,7 @@ mkdir -p "$OUT"
 cp "$SRC"/ESPHamClock/wasm/hamclock.* "$OUT"/
 cp "$ROOT"/web/index.html "$ROOT"/web/devserver.py "$OUT"/
 if [ "${STRIP:-0}" = 1 ]; then
-    wasm-opt --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext \
+    "$WASM_OPT" --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext \
         --strip-debug -O2 "$OUT/hamclock.wasm" -o "$OUT/hamclock.wasm"
 fi
 

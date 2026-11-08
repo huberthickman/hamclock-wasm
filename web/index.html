@@ -10,11 +10,45 @@
   #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
   canvas { width: 800px; height: 480px; touch-action: none; outline: none; }
   #status { position: fixed; left: 6px; bottom: 4px; opacity: .7; pointer-events: none; }
+
+  /* links HamClock opens: an in-page overlay for "embed" links, like Live Web's, and a bar
+     offering to open a link when the browser won't open a tab on its own */
+  #embed-overlay { display: none; position: fixed; inset: 3%; flex-direction: column; z-index: 1000;
+                   background: #111; border: 1px solid #888; box-shadow: 0 0 20px rgba(0,0,0,.7); }
+  #embed-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #222;
+                  color: #eee; font: 14px sans-serif; border-bottom: 1px solid #888; }
+  #embed-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #embed-note { display: none; padding: 6px 10px; background: #442; color: #fd8; font: 12px sans-serif;
+                border-bottom: 1px solid #888; }
+  #embed-frame { flex: 1; width: 100%; border: none; background: #fff; }
+  #url-bar { display: none; position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+             z-index: 1001; align-items: center; gap: 10px; max-width: 90vw; padding: 8px 12px;
+             background: #222; color: #eee; font: 14px sans-serif; border: 1px solid #888;
+             border-radius: 4px; box-shadow: 0 0 12px rgba(0,0,0,.7); }
+  #url-bar-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #embed-header button, #url-bar button { background: #333; color: #eee; border: 1px solid #888;
+             border-radius: 3px; padding: 4px 10px; font: 13px sans-serif; cursor: pointer; }
+  #embed-header button:hover, #url-bar button:hover { background: #444; }
 </style>
 </head>
 <body>
 <div id="wrap"><canvas id="screen" width="800" height="480" tabindex="0"></canvas></div>
 <div id="status">loading…</div>
+<div id="embed-overlay" role="dialog" aria-label="Linked page">
+  <div id="embed-header">
+    <span id="embed-title"></span>
+    <button id="embed-open">Open in new tab &#8599;</button>
+    <button id="embed-close">&#10005; Close</button>
+  </div>
+  <div id="embed-note">Taking a while to load? This site may not allow embedding; try "Open in new tab" above.</div>
+  <!-- credentialless: lets a page without COEP headers load inside this COEP page (Chromium) -->
+  <iframe id="embed-frame" credentialless referrerpolicy="no-referrer"></iframe>
+</div>
+<div id="url-bar" role="alert">
+  <span id="url-bar-text"></span>
+  <button id="url-bar-open">Open</button>
+  <button id="url-bar-close" aria-label="Dismiss">&#10005;</button>
+</div>
 <script>
 // Deployment defaults. Edit these for the host serving this page:
 //   DEFAULT_BACKEND_HOST  HamClock's -b argument
@@ -32,6 +66,17 @@ let BACKEND_BASE = params.get('backend') || DEFAULT_BACKEND_BASE;
 if (BACKEND_BASE === '/') BACKEND_BASE = location.origin;   // "/" + "/ham/..." would be protocol-relative
 BACKEND_BASE = BACKEND_BASE.replace(/\/+$/, '');
 const APPDIR = '/home/web_user/.hamclock';
+
+// restarts: HamClock asks for one with -K (skip the startup countdown) and/or -0 (restore default
+// settings), as it would re-run itself natively. Those are carried across the reload in
+// sessionStorage, read once and removed, so they never end up in the URL: a bookmarked or reloaded
+// "?args=-0" would wipe the settings every time.
+const RESTART_KEY = 'hamclock-restart-args';
+let restartArgs = [];
+try {
+  restartArgs = (sessionStorage.getItem(RESTART_KEY) || '').split(' ').filter(Boolean);
+  sessionStorage.removeItem(RESTART_KEY);
+} catch (e) {}
 
 const canvas = document.getElementById('screen');
 const ctx = canvas.getContext('2d');
@@ -58,8 +103,11 @@ var Module = {
       // -o: log to the console instead of a file
       // -b: backend, as on the native command line
       Module.callMain(['-b', BACKEND_HOST, '-e', '-1', '-r', '-1', '-w', '-1', '-o',
-                       ...(params.get('args') ? params.get('args').split(' ') : [])]);
+                       ...(params.get('args') ? params.get('args').split(' ') : []),
+                       ...restartArgs]);
       Module._hc_input_start();
+      running = true;
+      setInterval(() => { pollURL(); pollRestart(); }, 100);
       requestAnimationFrame(draw);
       setInterval(() => FS.syncfs(false, (e) => e && console.warn('IDBFS save', e)), 30000);
       addEventListener('pagehide', () => FS.syncfs(false, () => {}));
@@ -112,7 +160,10 @@ addEventListener('resize', fitScaling);
 const HCE_MOUSE = 1, HCE_TOUCH = 2, HCE_KEY = 3;
 const NAMED_KEYS = { Escape: 27, Enter: 10, Tab: 9, Delete: 127, Backspace: 8,
                      ArrowLeft: -1, ArrowDown: -2, ArrowUp: -3, ArrowRight: -4 };
-function event(type, a, b, c) { if (Module._hc_event) Module._hc_event(type, a, b, c); }
+// input before HamClock is running is dropped: the exported functions exist before the runtime
+// is ready, and calling one then aborts the whole program
+let running = false;
+function event(type, a, b, c) { if (running) Module._hc_event(type, a, b, c); }
 function appXY(e) {
   const r = canvas.getBoundingClientRect();
   return [Math.floor((e.clientX - r.left) * appW / r.width),
@@ -137,6 +188,114 @@ canvas.addEventListener('keydown', (e) => {
   if (c === undefined || c > 126) return;
   event(HCE_KEY, c, e.ctrlKey ? 1 : 0, e.shiftKey ? 1 : 0);
   e.preventDefault();
+});
+
+// restart: doReboot() raised hc_restart_req (see wasm_glue.cpp). Save ~/.hamclock first: HamClock
+// may have just written new settings, eg after restoring a saved configuration.
+const RESTART_K = 2, RESTART_0 = 4;
+let restarting = false;
+function pollRestart() {
+  const r = Module._hc_restart_req();
+  if (!r || restarting) return;
+  restarting = true;
+  const args = [];
+  if (r & RESTART_K) args.push('-K');
+  if (r & RESTART_0) args.push('-0');
+  try { sessionStorage.setItem(RESTART_KEY, args.join(' ')); } catch (e) {}
+  status('restarting…');
+  Module.FS.syncfs(false, (err) => {
+    if (err) console.warn('IDBFS save before restart', err);
+    location.reload();
+  });
+}
+
+// links: HamClock's openURL() hands urls to this page through wasm memory (see wasm_glue.cpp), as
+// "open URL" for a new tab or "embed URL" for the in-page overlay, used for sites known to allow
+// being framed -- the same two verbs Live Web uses.
+const EMBED_OK = 'credentialless' in HTMLIFrameElement.prototype;   // see the iframe above
+const $ = (id) => document.getElementById(id);
+let embedNoteTimer = null, urlBarTimer = null, urlBarURL = null;
+
+function pollURL() {
+  const p = Module._hc_url_take();
+  if (!p) return;
+  const msg = Module.UTF8ToString(p);
+  Module._hc_url_done();
+  const sp = msg.indexOf(' ');
+  const verb = msg.slice(0, sp), url = msg.slice(sp + 1);
+  if (!/^https?:\/\//i.test(url)) {               // never javascript:, data:, file: ...
+    console.warn('HamClock: not opening ' + url);
+    return;
+  }
+  if (verb === 'embed' && EMBED_OK)
+    showEmbed(url);
+  else
+    openTab(url);
+}
+
+// browsers only let a page open a tab shortly after a click or tap ("transient user activation").
+// The url usually arrives well within that window; if not, offer it in a bar the user can click.
+function openTab(url) {
+  if (navigator.userActivation) {
+    if (navigator.userActivation.isActive) {
+      window.open(url, '_blank', 'noopener');
+      return;
+    }
+  } else {
+    const w = window.open(url, '_blank');           // older browsers: null means it was blocked
+    if (w) {
+      w.opener = null;
+      return;
+    }
+  }
+  showURLBar(url);
+}
+
+function showURLBar(url) {
+  urlBarURL = url;
+  let host = url;
+  try { host = new URL(url).host; } catch (e) {}
+  $('url-bar-text').textContent = 'HamClock wants to open ' + host;
+  $('url-bar').title = url;
+  $('url-bar').style.display = 'flex';
+  clearTimeout(urlBarTimer);
+  urlBarTimer = setTimeout(hideURLBar, 60000);
+}
+function hideURLBar() {
+  $('url-bar').style.display = 'none';
+  urlBarURL = null;
+}
+$('url-bar-open').onclick = () => {                 // a click: opening a tab is allowed here
+  if (urlBarURL) window.open(urlBarURL, '_blank', 'noopener');
+  hideURLBar();
+  canvas.focus();
+};
+$('url-bar-close').onclick = () => { hideURLBar(); canvas.focus(); };
+
+// a cross-origin frame can't tell us whether the site refused to be framed, so, like Live Web,
+// "Open in new tab" is always there and a hint appears if the page seems slow
+function showEmbed(url) {
+  $('embed-title').textContent = url;
+  $('embed-note').style.display = 'none';
+  $('embed-frame').src = url;
+  $('embed-overlay').style.display = 'flex';
+  $('embed-close').focus();
+  clearTimeout(embedNoteTimer);
+  embedNoteTimer = setTimeout(() => { $('embed-note').style.display = 'block'; }, 4000);
+}
+function hideEmbed() {
+  $('embed-overlay').style.display = 'none';
+  $('embed-frame').src = 'about:blank';             // stop it running in the background
+  clearTimeout(embedNoteTimer);
+  canvas.focus();
+}
+$('embed-open').onclick = () => {
+  window.open($('embed-frame').src, '_blank', 'noopener');
+  hideEmbed();
+};
+$('embed-close').onclick = hideEmbed;
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('embed-overlay').style.display === 'flex') hideEmbed();
 });
 </script>
 <script src="hamclock.js"></script>

@@ -138,6 +138,91 @@ Coordinates are in app units (`tft.width()` × `tft.height()`). The page convert
 `getBoundingClientRect()`, so this works at any build size and display scale. Pointer events
 cover mouse, pen and touch.
 
+## Links (patch 0005)
+
+Natively, `openURL()` runs `open` or `xdg-open`. For a touch from a Live Web client it instead
+stages the URL (`openLiveWebURL()`), and the next Live Web poll sends it to that browser as
+`open URL`, or `embed URL` from `openURLPopupEmbed()` for sites known to allow framing, such as
+QRZ-style bio pages other than qrz.com, and the ADS-B map.
+
+The browser build reuses that path. A browser has no system browser to launch, so `openURL()` and
+`openURLPopupEmbed()` always stage, whether the request came from a tap or the keyboard. There's
+no Live Web client to poll for it, so instead:
+
+1. The input thread in `wasm_glue.cpp` collects the staged URL with `takeLiveWebURL()` and copies
+   it into a one-entry slot as `open URL` or `embed URL`.
+2. The page polls every 100 ms with `hc_url_take()`, copies the string and releases the slot with
+   `hc_url_done()`. Like input, this uses atomics only, so the page's thread never takes a
+   HamClock lock.
+3. The page ignores anything that isn't `http:` or `https:`.
+
+**New tabs and popup blockers.** Browsers only let a page open a tab shortly after a click, tap or
+key press ("transient user activation", about 5 seconds in Chromium). The URL normally arrives
+well within that window, so the page checks `navigator.userActivation.isActive`. If it's still
+active, the page opens the tab with `window.open(url, '_blank', 'noopener')`. If not, for example
+because HamClock was busy with a slow download when the tap arrived, the page shows a small bar,
+"HamClock wants to open ⟨host⟩ [Open]". Clicking Open is a fresh gesture, so the tab always opens.
+Browsers without `navigator.userActivation` try `window.open()` and fall back to the bar if it
+returns `null`.
+
+**The embed overlay** matches Live Web's: an `<iframe>` covering most of the clock, with "Open in
+new tab" and "Close" buttons, a hint after 4 seconds in case the site refuses to be framed, and
+Escape to close. One extra wrinkle comes from cross-origin isolation:
+`Cross-Origin-Embedder-Policy: require-corp` blocks iframes whose pages don't send matching
+headers, and ordinary sites don't. The iframe uses the `credentialless` attribute, which loads
+such pages without cookies, and Chromium allows that under COEP. Only Chromium-based browsers
+(Chrome and Edge 110+) support `credentialless`; Firefox and Safari, including Safari on iPad,
+don't, so there "embed" links open in a new tab instead of the overlay.
+
+Tested in headless Chromium: a real click through the MOTD popup's "Open link" opened the tab
+directly; the same taps fired with no user activation showed the bar, and its Open button opened
+the right URL; and a cross-origin page with no COEP headers loaded in the overlay while the page
+stayed cross-origin isolated.
+
+## Restarts (patch 0006)
+
+Natively, `doReboot()` calls `ESP::restart()`, which re-executes HamClock with the same arguments,
+adding `-K` (skip the startup countdown) and/or `-0` (restore default settings) when asked. A
+program can't re-execute itself in a browser: `execvp()` fails and HamClock exits, leaving the
+page frozen on its last frame. HamClock restarts itself in several places that stay visible in
+the browser build: restoring a saved configuration, "Reset to default configuration", and the
+fatal-error screen's restart button.
+
+So in the browser build, `doReboot()` calls `wasmRestart()` in `wasm_glue.cpp`, which:
+
+1. raises `restart_req` (atomic), with bits for `-K` and `-0`;
+2. waits forever, like `ESP::restart()`, which never returns either.
+
+The page checks `hc_restart_req()` every 100 ms. When it's set, the page:
+
+1. stores the `-K`/`-0` arguments in `sessionStorage`;
+2. saves `~/.hamclock` to IndexedDB with `FS.syncfs()` and waits for it to finish, since HamClock
+   may have just written new settings, for example a restored configuration;
+3. reloads.
+
+On load, the page reads the stored arguments, removes them, and appends them to `callMain()`.
+They deliberately never go in the URL: a bookmarked or manually reloaded `?args=-0` would reset
+the settings every time.
+
+The user can also restart simply by reloading the page. The only differences: a manual reload
+relies on the asynchronous save when the page closes (see [Storage](#storage)), and shows the
+startup countdown.
+
+**Menu items left out at compile time.** The `hamclock-wasm` target builds with:
+
+| Define | Removes | Why |
+|---|---|---|
+| `NO_UPGRADE` | the new-version check and upgrade prompt | upgrading downloads with curl and re-executes |
+| `NO_SYSTEM_CONTROLS` | Reboot computer, Shutdown computer | a page can't control the computer |
+| `NO_HAMCLOCK_CONTROLS` | Restart, Exit and Factory reset HamClock | reloading the page restarts; a page can't exit; clearing site data resets |
+
+The Android build sets the first two; it implements restart and exit natively.
+
+Tested in headless Chromium: restoring a saved configuration reloaded the page and the next start
+received `-K` and skipped Setup; "Reset to default configuration" reloaded with `-K -0` and showed
+Setup with default settings; a manual reload afterwards received neither flag; and
+`sessionStorage` was empty after each restart.
+
 ## Platform stubs (patch 0002)
 
 | Native behavior | Browser build |
@@ -191,7 +276,7 @@ print. `hamclock.js` supplies all of that:
   response into wasm memory.
 - **Exposes the API the page uses.** `Module.callMain`, `Module.FS`, `Module.HEAPU8`,
   `Module.ENV`, and the exported C functions such as `Module._hc_fb_pixels`,
-  `Module._hc_fb_frames` and `Module._hc_event`.
+  `Module._hc_fb_frames`, `Module._hc_event`, `Module._hc_url_take` and `Module._hc_restart_req`.
 
 Never edit `hamclock.js`, because the next build overwrites it. Changes go in the C++ (the
 request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makefile, or
@@ -218,6 +303,10 @@ request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makef
 | `-lidbfs.js` | Persistent `~/.hamclock` |
 | `-sFETCH -sFETCH_SUPPORT_INDEXEDDB=0` | Emscripten's Fetch API for `WiFiClient`, without its IndexedDB cache |
 | `-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,…` | What `index.html` uses |
+
+The compile step also gets `-D_WEB_ONLY`, the size's `-D_CLOCK_WxH`, and the three `NO_*` defines
+described under [Restarts](#restarts-patch-0006). The Makefile records the size and defines in
+`.wasm-size` and cleans the tree whenever they change, because object files don't record them.
 
 Sizes with Emscripten 3.1.51 and LLVM 18: the wasm is 9 to 10 MB with HamClock's default `-g`.
 After `wasm-opt --strip-debug -O2` it's 1.7 MB (800x480) to 1.9 MB (1600x960), or about

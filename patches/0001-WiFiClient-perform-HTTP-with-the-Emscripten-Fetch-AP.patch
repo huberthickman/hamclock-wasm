@@ -1,0 +1,427 @@
+From 737328640566545390cdb78f4180e85b055935b9 Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sun, 1 Nov 2026 23:41:49 -0600
+Subject: [PATCH 1/6] WiFiClient: perform HTTP with the Emscripten Fetch API in
+ browser builds
+
+Browsers cannot open raw TCP sockets. In __EMSCRIPTEN__ builds, connect()
+to port 80/443/8080 creates a virtual connection: write() accumulates the
+hand-built HTTP/1.0 request, the first read performs it with
+emscripten_fetch() in EMSCRIPTEN_FETCH_SYNCHRONOUS mode (a synchronous
+XMLHttpRequest underneath, legal because the wasm build runs HamClock in a
+Web Worker), and the reply is re-serialized as an HTTP/1.0 response so
+httpSkipHeader() and all existing callers work unchanged.
+
+- backend_host requests can be redirected to a same-origin or CORS-enabled
+  base URL via the HC_BACKEND_BASE environment variable.
+- If-Modified-Since is forwarded, so 304 responses reach cachefile.cpp.
+- Browsers forbid setting User-Agent, so HamClock's telemetry UA line is
+  forwarded as X-HamClock-UA.
+- EMSCRIPTEN_FETCH_REPLACE skips the Fetch API's IndexedDB cache; HamClock
+  keeps its own in ~/.hamclock.
+- connectCommand() (curl pipes for https) extracts the URL and fetches it
+  directly, delivering only the body as curl would.
+- Other ports (DX cluster, APRS-IS, rigctld, gpsd...) fail with a log line.
+
+Native builds are unaffected: all changes are inside #if __EMSCRIPTEN__.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/ArduinoLib/WiFiClient.cpp | 288 ++++++++++++++++++++++++++
+ ESPHamClock/ArduinoLib/WiFiClient.h   |  18 ++
+ 2 files changed, 306 insertions(+)
+
+diff --git a/ESPHamClock/ArduinoLib/WiFiClient.cpp b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+index c6f0b71..8d3b922 100644
+--- a/ESPHamClock/ArduinoLib/WiFiClient.cpp
++++ b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+@@ -6,6 +6,197 @@
+ #include "IPAddress.h"
+ #include "WiFiClient.h"
+ 
++#if defined(__EMSCRIPTEN__)
++#include <string>
++#include <strings.h>
++#include <emscripten/fetch.h>
++
++/* browser build: HTTP over Emscripten's Fetch API.
++ *
++ * Browsers can not open raw sockets. Instead, connect() to an HTTP port creates a virtual
++ * connection, write() collects the request HamClock builds by hand, and the first read performs
++ * it with emscripten_fetch() in EMSCRIPTEN_FETCH_SYNCHRONOUS mode. Underneath that is a synchronous
++ * XMLHttpRequest, which browsers only allow off their main thread; that is why the wasm build links
++ * with -sPROXY_TO_PTHREAD: all of HamClock runs in a Web Worker and blocks here just as it blocks
++ * in read(2) on a real socket. The reply is re-serialized as an HTTP/1.0 response so httpSkipHeader()
++ * and all existing callers work unchanged.
++ *
++ * Notes:
++ *   backend_host requests may be redirected to a same-origin or CORS-enabled base URL given in the
++ *     HC_BACKEND_BASE environment variable, eg "/ohb" or "https://ohb.hamclock.app".
++ *   Browsers will not let a page set User-Agent, so HamClock's (telemetry-laden) UA line is
++ *     forwarded as X-HamClock-UA instead.
++ *   Browsers ignore timeouts on synchronous requests, so a server that accepts but never answers
++ *     holds this thread until the browser gives up.
++ */
++
++static int wasm_next_fd = 100000;         // fake fds for virtual connections, never passed to libc
++
++void WiFiClient::wasmReset()
++{
++    if (m_req) free (m_req);
++    if (m_resp) free (m_resp);
++    m_req = nullptr;
++    m_resp = nullptr;
++    m_req_len = m_req_max = 0;
++    m_resp_len = m_resp_pos = 0;
++    m_isHttp = m_bodyOnly = m_fetched = false;
++    m_host[0] = '\0';
++    m_port = 0;
++}
++
++// return s without leading or trailing blanks
++static std::string trimBlanks (const std::string &s)
++{
++    size_t a = s.find_first_not_of (" \t");
++    if (a == std::string::npos)
++        return ("");
++    size_t b = s.find_last_not_of (" \t");
++    return (s.substr (a, b - a + 1));
++}
++
++// call fn(name,value) for each "name: value" line in a CRLF-separated block, starting at pos.
++// stops at the first empty line.
++template <typename F> static void forEachHeader (const std::string &block, size_t pos, F fn)
++{
++    while (pos < block.size()) {
++        size_t eol = block.find ("\r\n", pos);
++        std::string line = block.substr (pos, eol == std::string::npos ? std::string::npos : eol - pos);
++        if (line.empty())
++            break;
++        size_t colon = line.find (':');
++        if (colon != std::string::npos)
++            fn (trimBlanks (line.substr (0, colon)), trimBlanks (line.substr (colon + 1)), line);
++        if (eol == std::string::npos)
++            break;
++        pos = eol + 2;
++    }
++}
++
++bool WiFiClient::wasmPerform()
++{
++    m_fetched = true;
++
++    // build the URL and pick out the request headers worth forwarding
++    std::string url, ims, ua;
++    if (!m_host[0]) {
++
++        // curl mode: m_req is the bare URL
++        url = m_req ? m_req : "";
++
++    } else {
++
++        std::string req (m_req ? m_req : "", m_req_len);
++
++        // request line: GET <path> HTTP/1.0
++        size_t eol = req.find ("\r\n");
++        std::string line0 = req.substr (0, eol);
++        size_t sp1 = line0.find (' ');
++        size_t sp2 = sp1 == std::string::npos ? std::string::npos : line0.find (' ', sp1 + 1);
++        if (line0.compare (0, 4, "GET ") != 0 || sp2 == std::string::npos) {
++            printf ("WiFiCl: unexpected request: %s\n", line0.c_str());
++            return (false);
++        }
++        std::string path = line0.substr (sp1 + 1, sp2 - sp1 - 1);
++
++        if (eol != std::string::npos)
++            forEachHeader (req, eol + 2, [&](const std::string &name, const std::string &value,
++                                                                            const std::string &) {
++                if (strcasecmp (name.c_str(), "If-Modified-Since") == 0)
++                    ims = value;
++                else if (strcasecmp (name.c_str(), "User-Agent") == 0)
++                    ua = value;
++            });
++
++        // origin: backend_host may be redirected to a same-origin or CORS-enabled base
++        const char *be = getenv ("HC_BACKEND_BASE");
++        if (be && be[0] && strcmp (m_host, backend_host) == 0) {
++            url = be;
++        } else {
++            url = m_port == 443 ? "https://" : "http://";
++            url += m_host;
++            if (m_port != 80 && m_port != 443)
++                url += ":" + std::to_string (m_port);
++        }
++        url += path;
++    }
++
++    // name/value pairs, NULL terminated
++    const char *headers[5];
++    int n_h = 0;
++    if (!ims.empty()) {
++        headers[n_h++] = "If-Modified-Since";
++        headers[n_h++] = ims.c_str();
++    }
++    if (!ua.empty()) {
++        headers[n_h++] = "X-HamClock-UA";
++        headers[n_h++] = ua.c_str();
++    }
++    headers[n_h] = NULL;
++
++    // perform, blocking this thread. REPLACE skips the IndexedDB lookup the Fetch API does by default;
++    // HamClock keeps its own cache in ~/.hamclock.
++    emscripten_fetch_attr_t attr;
++    emscripten_fetch_attr_init (&attr);
++    strcpy (attr.requestMethod, "GET");
++    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS | EMSCRIPTEN_FETCH_REPLACE;
++    attr.requestHeaders = headers;
++    emscripten_fetch_t *f = emscripten_fetch (&attr, url.c_str());
++    if (!f) {
++        printf ("WiFiCl: GET %s: emscripten_fetch() refused\n", url.c_str());
++        return (false);
++    }
++    if (f->status == 0) {
++        // the browser reports no status for network errors, CORS refusals and unreachable hosts
++        printf ("WiFiCl: GET %s failed: network error, CORS refusal or unreachable host\n", url.c_str());
++        emscripten_fetch_close (f);
++        return (false);
++    }
++    size_t body_len = (size_t) f->numBytes;
++
++    // unless curl mode, rebuild an HTTP/1.0 response head from what the browser exposes
++    std::string head;
++    if (!m_bodyOnly) {
++        char status_line[128];
++        snprintf (status_line, sizeof(status_line), "HTTP/1.0 %d %s\r\n", (int)f->status,
++                                                        f->statusText[0] ? f->statusText : "OK");
++        head = status_line;
++
++        size_t hl = emscripten_fetch_get_response_headers_length (f);
++        std::string all (hl, '\0');
++        if (hl > 0)
++            emscripten_fetch_get_response_headers (f, &all[0], hl);
++        all.resize (strlen (all.c_str()));
++        forEachHeader (all, 0, [&](const std::string &name, const std::string &, const std::string &line) {
++            // the browser already undid any transfer or content encoding
++            if (strcasecmp (name.c_str(), "Content-Length") && strcasecmp (name.c_str(), "Content-Encoding")
++                        && strcasecmp (name.c_str(), "Transfer-Encoding") && strcasecmp (name.c_str(), "Connection"))
++                head += line + "\r\n";
++        });
++        head += "Content-Length: " + std::to_string (body_len) + "\r\nConnection: close\r\n\r\n";
++    }
++
++    // save for available() and read() to drain
++    m_resp_len = head.size() + body_len;
++    m_resp = (uint8_t *) malloc (m_resp_len > 0 ? m_resp_len : 1);
++    if (!m_resp) {
++        emscripten_fetch_close (f);
++        return (false);
++    }
++    memcpy (m_resp, head.data(), head.size());
++    if (body_len > 0)
++        memcpy (m_resp + head.size(), f->data, body_len);
++    m_resp_pos = 0;
++
++    if (debugLevel (DEBUG_NET, 1))
++        printf ("WiFiCl: GET %s -> %d, %d bytes\n", url.c_str(), (int)f->status, m_resp_len);
++
++    emscripten_fetch_close (f);
++    return (true);
++}
++
++#endif // __EMSCRIPTEN__
++
+ // default constructor
+ WiFiClient::WiFiClient()
+ {
+@@ -16,6 +207,11 @@ WiFiClient::WiFiClient()
+     read_pending_ms = get_timeout_ms();
+     m_isPipe = false;
+     m_pipe = nullptr;
++#if defined(__EMSCRIPTEN__)
++    m_req = nullptr;
++    m_resp = nullptr;
++    wasmReset();
++#endif
+ }
+ 
+ // constructor handed an open socket to use
+@@ -30,6 +226,11 @@ WiFiClient::WiFiClient(int fd)
+     next_peek = 0;
+     m_isPipe = false;
+     m_pipe = nullptr;
++#if defined(__EMSCRIPTEN__)
++    m_req = nullptr;
++    m_resp = nullptr;
++    wasmReset();
++#endif
+ }
+ 
+ // return whether this socket is active
+@@ -110,6 +311,26 @@ extern "C" bool android_connect_http(const char *cmd, int *read_fd);
+ 
+ bool WiFiClient::connectCommand(const char* command)
+ {
++#if defined(__EMSCRIPTEN__)
++    // no processes in a browser: pull the URL out of the curl command and fetch it directly.
++    // curl prints only the body, so deliver it without headers.
++    stop();
++    const char *u = strstr (command, "https://");
++    if (!u)
++        u = strstr (command, "http://");
++    if (!u)
++        return (false);
++    int ul = strcspn (u, " \"'");
++    m_isHttp = true;
++    m_bodyOnly = true;
++    m_req = (char *) malloc (ul + 1);
++    memcpy (m_req, u, ul);
++    m_req[ul] = '\0';
++    m_req_len = m_req_max = ul;
++    socket = wasm_next_fd++;
++    n_peek = next_peek = 0;
++    return (true);
++#endif
+     /* clean up any previous pipe */
+     if (m_pipe) {
+         pclose(m_pipe);
+@@ -161,6 +382,23 @@ bool WiFiClient::connect(const char *host, int port)
+     /* connect is not a command pipe so clear pipe information */
+     m_isPipe = false;
+     m_pipe = nullptr;
++
++#if defined(__EMSCRIPTEN__)
++    // browser build: HTTP becomes a virtual connection performed later with XHR; browsers can
++    // not open raw TCP (DX cluster, APRS-IS, rigctld, gpsd...) without a WebSocket relay.
++    stop();
++    if (port == 80 || port == 443 || port == 8080) {
++        m_isHttp = true;
++        snprintf (m_host, sizeof(m_host), "%s", host);
++        m_port = port;
++        socket = wasm_next_fd++;
++        n_peek = next_peek = 0;
++        return (true);
++    }
++    printf ("WiFiCl: %s:%d: raw TCP is not available in the browser build\n", host, port);
++    errno = ENOTSUP;
++    return (false);
++#endif
+     /* lookup host address.
+      * N.B. must call freeaddrinfo(aip) after successful call before returning
+      */
+@@ -216,6 +454,9 @@ bool WiFiClient::connect(IPAddress ip, int port)
+ void WiFiClient::setNoDelay(bool on)
+ {
+     // control Nagle algorithm
++#if defined(__EMSCRIPTEN__)
++    if (m_isHttp) return;
++#endif
+     socklen_t flag = on;
+     if (setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, (void *) &flag, sizeof(flag)) < 0)
+         printf ("WiFiCl: TCP_NODELAY(%d): %s\n", on, strerror(errno));     // not fatal
+@@ -223,6 +464,15 @@ void WiFiClient::setNoDelay(bool on)
+ 
+ void WiFiClient::stop()
+ {
++#if defined(__EMSCRIPTEN__)
++    if (m_isHttp) {
++        wasmReset();
++        socket = -1;
++        n_peek = 0;
++        next_peek = 0;
++        return;
++    }
++#endif
+     if (m_isPipe) {
+         if (m_pipe != nullptr) {
+             pclose(m_pipe);
+@@ -292,6 +542,27 @@ int WiFiClient::available (int pending_ms)
+     if (next_peek < n_peek)
+         return (1);
+ 
++#if defined(__EMSCRIPTEN__)
++    if (m_isHttp) {
++        if (!m_fetched && !wasmPerform()) {
++            stop();
++            return (0);
++        }
++        if (m_resp_pos < m_resp_len) {
++            int n = m_resp_len - m_resp_pos;
++            if (n > (int)sizeof(peek))
++                n = sizeof(peek);
++            memcpy (peek, m_resp + m_resp_pos, n);
++            m_resp_pos += n;
++            n_peek = n;
++            next_peek = 0;
++            return (1);
++        }
++        stop();                             // like EOF on a real socket
++        return (0);
++    }
++#endif
++
+     // wait as instructed
+     if (!pending(pending_ms))
+         return (0);
+@@ -363,6 +634,19 @@ int WiFiClient::write (const uint8_t *buf, int n)
+     if (socket < 0)
+         return (0);
+ 
++#if defined(__EMSCRIPTEN__)
++    if (m_isHttp) {
++        if (m_req_len + n + 1 > m_req_max) {
++            m_req_max = (m_req_len + n + 1) * 2;
++            m_req = (char *) realloc (m_req, m_req_max);
++        }
++        memcpy (m_req + m_req_len, buf, n);
++        m_req_len += n;
++        m_req[m_req_len] = '\0';
++        return (n);
++    }
++#endif
++
+     int nw = 0;
+     for (int ntot = 0; ntot < n; ntot += nw) {
+         nw = ::write (socket, buf+ntot, n-ntot);
+@@ -494,6 +778,10 @@ void WiFiClient::println (uint32_t i)
+ 
+ IPAddress WiFiClient::remoteIP()
+ {
++#if defined(__EMSCRIPTEN__)
++    if (m_isHttp)
++        return (IPAddress(0,0,0,0));
++#endif
+     struct sockaddr_in sa;
+     socklen_t len = sizeof(sa);
+ 
+diff --git a/ESPHamClock/ArduinoLib/WiFiClient.h b/ESPHamClock/ArduinoLib/WiFiClient.h
+index e27c420..34dd6d7 100644
+--- a/ESPHamClock/ArduinoLib/WiFiClient.h
++++ b/ESPHamClock/ArduinoLib/WiFiClient.h
+@@ -79,6 +79,24 @@ private:
+     bool m_isPipe;
+     FILE* m_pipe;
+ 
++#if defined(__EMSCRIPTEN__)
++    // browser build: no raw sockets. HTTP "connections" are virtual: writes accumulate the
++    // request, the first read performs it with emscripten_fetch() in synchronous mode (legal
++    // because HamClock runs in a Web Worker under PROXY_TO_PTHREAD), and reads then drain the
++    // synthesized response.
++    bool m_isHttp;                          // this is a virtual HTTP connection
++    bool m_bodyOnly;                        // curl-style: deliver body without headers
++    bool m_fetched;                         // request has been performed
++    char m_host[128];                       // host as given to connect()
++    int m_port;                             // port as given to connect()
++    char *m_req;                            // accumulated request text
++    int m_req_len, m_req_max;
++    uint8_t *m_resp;                        // malloced synthesized response
++    int m_resp_len, m_resp_pos;
++    void wasmReset();
++    bool wasmPerform();
++#endif
++
+ };
+ 
+ 
+-- 
+2.43.0
+

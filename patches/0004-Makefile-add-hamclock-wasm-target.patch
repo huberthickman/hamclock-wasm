@@ -1,7 +1,7 @@
-From 8b19f803c294fe0c5d25ea138cef302e28da043f Mon Sep 17 00:00:00 2001
+From ea793ce32f8ec49939ea90287b83350b61741767 Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
-Date: Sun, 1 Nov 2026 23:41:50 -0600
-Subject: [PATCH 4/4] Makefile: add hamclock-wasm target
+Date: Sat, 7 Nov 2026 20:53:15 -0600
+Subject: [PATCH 4/6] Makefile: add hamclock-wasm target
 
   make hamclock-wasm CXX=em++ CC=emcc AR=emar RANLIB=emranlib [WASM_SIZE=1600x960]
 
@@ -9,20 +9,27 @@ Builds the _WEB_ONLY variant for the browser with -sPROXY_TO_PTHREAD so all
 of HamClock runs in a Web Worker where blocking network reads are allowed,
 and -sFETCH for the Emscripten Fetch API WiFiClient uses (its IndexedDB
 support is turned off: HamClock keeps its own cache).
+
 WASM_SIZE selects 800x480 (default), 1600x960, 2400x1440 or 3200x1920.
-Because objects do not record their build size, the tree is cleaned
-automatically when the size changes or after a native build (.wasm-size).
+
+Compiles with NO_UPGRADE, NO_SYSTEM_CONTROLS and NO_HAMCLOCK_CONTROLS: a
+browser can't upgrade HamClock or reboot or shut down the computer, and a
+page can't exit. (The Android build sets the first two.)
+
+Because objects do not record the size or defines they were built with,
+the tree is cleaned automatically when either changes or after a native
+build (.wasm-size).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- ESPHamClock/Makefile | 35 ++++++++++++++++++++++++++++++++++-
- 1 file changed, 34 insertions(+), 1 deletion(-)
+ ESPHamClock/Makefile | 40 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
 
 diff --git a/ESPHamClock/Makefile b/ESPHamClock/Makefile
-index ce2dd95..39e36f2 100644
+index ce2dd95..608bba8 100644
 --- a/ESPHamClock/Makefile
 +++ b/ESPHamClock/Makefile
-@@ -354,12 +354,45 @@ install:
+@@ -354,12 +354,50 @@ install:
  		&& chmod u+s $$TARGET; \
  	fi
  
@@ -41,19 +48,24 @@ index ce2dd95..39e36f2 100644
 +	-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,UTF8ToString,stringToNewUTF8,callMain,ENV \
 +	-sEXPORTED_FUNCTIONS=_main,_malloc,_free
 +
++# compile-time switches: a browser can't upgrade HamClock or reboot or shut down the computer, and a
++# page can't exit, so leave those out of the menus. (Restart works: doReboot() reloads the page.)
++WASM_DEFINES = -D_WEB_ONLY $(if $(filter-out 800x480,$(WASM_SIZE)),-D_CLOCK_$(WASM_SIZE)) \
++	-DNO_UPGRADE -DNO_SYSTEM_CONTROLS -DNO_HAMCLOCK_CONTROLS
++
 +ifneq ($(filter hamclock-wasm,$(MAKECMDGOALS)),)
 +    ifeq ($(filter $(WASM_SIZE),800x480 1600x960 2400x1440 3200x1920),)
 +        $(error WASM_SIZE must be 800x480, 1600x960, 2400x1440 or 3200x1920)
 +    endif
-+    # objects don't record the size or target they were built for, so start clean whenever the
-+    # size changes or the tree was last built natively (no .wasm-size yet)
-+    ifneq ($(shell cat .wasm-size 2>/dev/null),$(WASM_SIZE))
-+        $(info hamclock-wasm: new size $(WASM_SIZE), cleaning first)
-+        $(shell $(MAKE) --no-print-directory clean >/dev/null 2>&1; echo $(WASM_SIZE) > .wasm-size)
++    # objects don't record the size or defines they were built with, so start clean whenever
++    # either changes or the tree was last built natively (no .wasm-size yet)
++    ifneq ($(shell cat .wasm-size 2>/dev/null),$(strip $(WASM_SIZE) $(WASM_DEFINES)))
++        $(info hamclock-wasm: new size or defines, cleaning first)
++        $(shell $(MAKE) --no-print-directory clean >/dev/null 2>&1; echo '$(strip $(WASM_SIZE) $(WASM_DEFINES))' > .wasm-size)
 +    endif
 +endif
 +
-+hamclock-wasm: CXXFLAGS+=-D_WEB_ONLY $(if $(filter-out 800x480,$(WASM_SIZE)),-D_CLOCK_$(WASM_SIZE))
++hamclock-wasm: CXXFLAGS+=$(WASM_DEFINES)
 +hamclock-wasm: $(OBJS) wasm_glue.o hclibs
 +	mkdir -p wasm
 +	$(CXX) $(LDXXFLAGS) $(OBJS) wasm_glue.o -o wasm/hamclock.js $(LIBS) $(WASM_LDFLAGS)

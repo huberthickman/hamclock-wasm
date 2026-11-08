@@ -1,0 +1,109 @@
+From b0fd2389d5c8471c85fbfb8e8f91e69e78042f95 Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sat, 7 Nov 2026 20:53:16 -0600
+Subject: [PATCH 6/6] Restart by reloading the browser page
+
+A program can't re-exec itself in a browser, so in Emscripten builds
+doReboot() calls the new wasmRestart() instead of ESP::restart(). It raises
+a flag the page polls (hc_restart_req()); the page saves ~/.hamclock to
+IndexedDB and reloads itself, passing -K and -0 on to the next start just
+as ESP::restart() would. wasmRestart() never returns, like ESP::restart().
+
+This keeps the restarts HamClock starts by itself working: restoring a
+saved configuration, "Reset to default configuration", and the fatal error
+screen's restart button.
+
+All changes are inside #if __EMSCRIPTEN__.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/ESPHamClock.cpp |  5 ++++-
+ ESPHamClock/HamClock.h      |  1 +
+ ESPHamClock/wasm_glue.cpp   | 29 +++++++++++++++++++++++++++++
+ 3 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/ESPHamClock/ESPHamClock.cpp b/ESPHamClock/ESPHamClock.cpp
+index 6c285d4..471f534 100644
+--- a/ESPHamClock/ESPHamClock.cpp
++++ b/ESPHamClock/ESPHamClock.cpp
+@@ -2833,7 +2833,10 @@ static void runShutdownMenu(void)
+ void doReboot(bool minus_K, bool minus_0)
+ {
+     defaultState();
+-#if defined(_IS_ANDROID)
++#if defined(__EMSCRIPTEN__)
++    // browser: a program can't re-exec itself, but the page can reload -- see wasm_glue.cpp
++    wasmRestart (minus_K, minus_0);
++#elif defined(_IS_ANDROID)
+     android_request_restart(minus_K);
+     for(;;);
+ #else
+diff --git a/ESPHamClock/HamClock.h b/ESPHamClock/HamClock.h
+index 115f6ac..73eff24 100644
+--- a/ESPHamClock/HamClock.h
++++ b/ESPHamClock/HamClock.h
+@@ -2050,6 +2050,7 @@ extern void openLiveWebURL (const char *url);
+ extern void openLiveWebURLEmbedded (const char *url);
+ #if defined(__EMSCRIPTEN__)
+ extern bool takeLiveWebURL (char *buf, size_t buf_len);
++extern void wasmRestart (bool minus_K, bool minus_0);
+ #endif
+ extern void requestLiveWebPaste (void);
+ extern bool isLiveWebTouch (void);
+diff --git a/ESPHamClock/wasm_glue.cpp b/ESPHamClock/wasm_glue.cpp
+index 8dc6c70..7ec64f3 100644
+--- a/ESPHamClock/wasm_glue.cpp
++++ b/ESPHamClock/wasm_glue.cpp
+@@ -12,6 +12,10 @@
+  * URLs go the other way through a one-entry slot: openURL() stages a url exactly as for a Live
+  * Web touch, the input thread moves it into url_slot, and the page takes it with hc_url_take() /
+  * hc_url_done(), again with atomics only.
++ *
++ * Restarts: a program can't re-exec itself in a browser, so doReboot() calls wasmRestart(), which
++ * raises restart_req; the page saves ~/.hamclock to IndexedDB and reloads itself, passing -K/-0 on
++ * to the next start (see index.html).
+  */
+ 
+ #if defined(__EMSCRIPTEN__)
+@@ -55,6 +59,25 @@ static void dispatch (const HCEvent &e)
+     }
+ }
+ 
++// restart request for the page: 0 none, else RESTART_REQ | RESTART_K | RESTART_0
++#define RESTART_REQ 1
++#define RESTART_K   2                           // skip the startup countdown (-K)
++#define RESTART_0   4                           // restore default settings (-0)
++static std::atomic<int> restart_req;
++
++/* ask the page to restart HamClock by reloading itself, carrying -K/-0 as ESP::restart() would.
++ * never returns, like ESP::restart(): this thread just waits for the page to go away.
++ */
++void wasmRestart (bool minus_K, bool minus_0)
++{
++    Serial.printf ("Restart: asking the page to reload%s%s\n", minus_K ? " with -K" : "",
++                                                                minus_0 ? " with -0" : "");
++    restart_req.store (RESTART_REQ | (minus_K ? RESTART_K : 0) | (minus_0 ? RESTART_0 : 0),
++                                                                std::memory_order_release);
++    for (;;)
++        usleep (1000000);
++}
++
+ // one staged url for the page, as "open URL" or "embed URL"; url_ready says url_slot is full
+ static char url_slot[2048];
+ static std::atomic<int> url_ready;
+@@ -130,6 +153,12 @@ EMSCRIPTEN_KEEPALIVE void hc_url_done (void)
+     url_ready.store (0, std::memory_order_release);
+ }
+ 
++// return 0, or the RESTART_* bits if HamClock wants the page to reload
++EMSCRIPTEN_KEEPALIVE int hc_restart_req (void)
++{
++    return (restart_req.load (std::memory_order_acquire));
++}
++
+ } // extern "C"
+ 
+ #endif // __EMSCRIPTEN__
+-- 
+2.43.0
+
