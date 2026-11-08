@@ -1,7 +1,7 @@
 From d36674eeca36ab5e27471c63364bc719b97deb91 Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
 Date: Sun, 1 Nov 2026 23:41:49 -0600
-Subject: [PATCH 2/4] Platform stubs for Emscripten builds
+Subject: [PATCH 2/5] Platform stubs for Emscripten builds
 
 - WiFi::status() reports connected: there are no interfaces to enumerate.
 - WiFi::localIP() returns 0.0.0.0 without opening a probe socket.

@@ -1,7 +1,7 @@
 From 6c295e947737418f0f4b16aea1609f5dd22b44e2 Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
 Date: Sun, 1 Nov 2026 23:41:50 -0600
-Subject: [PATCH 3/4] Expose web-only framebuffer and input to a browser host
+Subject: [PATCH 3/5] Expose web-only framebuffer and input to a browser host
  page
 
 The _WEB_ONLY build already renders into an in-memory stage buffer for

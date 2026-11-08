@@ -1,7 +1,7 @@
 From 8b19f803c294fe0c5d25ea138cef302e28da043f Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
 Date: Sun, 1 Nov 2026 23:41:50 -0600
-Subject: [PATCH 4/4] Makefile: add hamclock-wasm target
+Subject: [PATCH 4/5] Makefile: add hamclock-wasm target
 
   make hamclock-wasm CXX=em++ CC=emcc AR=emar RANLIB=emranlib [WASM_SIZE=1600x960]
 

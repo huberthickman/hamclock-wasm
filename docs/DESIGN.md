@@ -138,6 +138,47 @@ Coordinates are in app units (`tft.width()` × `tft.height()`). The page convert
 `getBoundingClientRect()`, so this works at any build size and display scale. Pointer events
 cover mouse, pen and touch.
 
+## Links (patch 0005)
+
+Natively, `openURL()` runs `open` or `xdg-open`. For a touch from a Live Web client it instead
+stages the URL (`openLiveWebURL()`), and the next Live Web poll sends it to that browser as
+`open URL`, or `embed URL` from `openURLPopupEmbed()` for sites known to allow framing, such as
+QRZ-style bio pages other than qrz.com, and the ADS-B map.
+
+The browser build reuses that path. A browser has no system browser to launch, so `openURL()` and
+`openURLPopupEmbed()` always stage, whether the request came from a tap or the keyboard. There's
+no Live Web client to poll for it, so instead:
+
+1. The input thread in `wasm_glue.cpp` collects the staged URL with `takeLiveWebURL()` and copies
+   it into a one-entry slot as `open URL` or `embed URL`.
+2. The page polls every 100 ms with `hc_url_take()`, copies the string and releases the slot with
+   `hc_url_done()`. Like input, this uses atomics only, so the page's thread never takes a
+   HamClock lock.
+3. The page ignores anything that isn't `http:` or `https:`.
+
+**New tabs and popup blockers.** Browsers only let a page open a tab shortly after a click, tap or
+key press ("transient user activation", about 5 seconds in Chromium). The URL normally arrives
+well within that window, so the page checks `navigator.userActivation.isActive`. If it's still
+active, the page opens the tab with `window.open(url, '_blank', 'noopener')`. If not, for example
+because HamClock was busy with a slow download when the tap arrived, the page shows a small bar,
+"HamClock wants to open ⟨host⟩ [Open]". Clicking Open is a fresh gesture, so the tab always opens.
+Browsers without `navigator.userActivation` try `window.open()` and fall back to the bar if it
+returns `null`.
+
+**The embed overlay** matches Live Web's: an `<iframe>` covering most of the clock, with "Open in
+new tab" and "Close" buttons, a hint after 4 seconds in case the site refuses to be framed, and
+Escape to close. One extra wrinkle comes from cross-origin isolation:
+`Cross-Origin-Embedder-Policy: require-corp` blocks iframes whose pages don't send matching
+headers, and ordinary sites don't. The iframe uses the `credentialless` attribute, which loads
+such pages without cookies, and Chromium allows that under COEP. Only Chromium-based browsers
+(Chrome and Edge 110+) support `credentialless`; Firefox and Safari, including Safari on iPad,
+don't, so there "embed" links open in a new tab instead of the overlay.
+
+Tested in headless Chromium: a real click through the MOTD popup's "Open link" opened the tab
+directly; the same taps fired with no user activation showed the bar, and its Open button opened
+the right URL; and a cross-origin page with no COEP headers loaded in the overlay while the page
+stayed cross-origin isolated.
+
 ## Platform stubs (patch 0002)
 
 | Native behavior | Browser build |
@@ -191,7 +232,7 @@ print. `hamclock.js` supplies all of that:
   response into wasm memory.
 - **Exposes the API the page uses.** `Module.callMain`, `Module.FS`, `Module.HEAPU8`,
   `Module.ENV`, and the exported C functions such as `Module._hc_fb_pixels`,
-  `Module._hc_fb_frames` and `Module._hc_event`.
+  `Module._hc_fb_frames`, `Module._hc_event` and `Module._hc_url_take`.
 
 Never edit `hamclock.js`, because the next build overwrites it. Changes go in the C++ (the
 request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makefile, or

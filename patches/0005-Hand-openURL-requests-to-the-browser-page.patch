@@ -1,0 +1,158 @@
+From a386582026b094df7c4778957445222fc9fdb449 Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sat, 7 Nov 2026 19:36:28 -0600
+Subject: [PATCH 5/5] Hand openURL() requests to the browser page
+
+The browser build has no system browser to launch, so openURL() and
+openURLPopupEmbed() always stage the url the way they already do for a
+Live Web touch, whether the request came from a tap or the keyboard.
+
+Instead of a Live Web client polling for it, wasm_glue.cpp's input thread
+collects the staged url with the new takeLiveWebURL() and puts it in a
+one-entry slot as "open URL" or "embed URL" -- the same verbs sendURL()
+sends. The page takes it with hc_url_take()/hc_url_done(), using atomics
+only, so the browser main thread never takes a HamClock lock.
+
+All changes are inside #if __EMSCRIPTEN__.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/HamClock.h    |  3 +++
+ ESPHamClock/liveweb.cpp   | 21 +++++++++++++++++++++
+ ESPHamClock/qrz.cpp       | 11 +++++++++++
+ ESPHamClock/wasm_glue.cpp | 24 ++++++++++++++++++++++++
+ 4 files changed, 59 insertions(+)
+
+diff --git a/ESPHamClock/HamClock.h b/ESPHamClock/HamClock.h
+index 7458c50..115f6ac 100644
+--- a/ESPHamClock/HamClock.h
++++ b/ESPHamClock/HamClock.h
+@@ -2048,6 +2048,9 @@ extern bool liveweb_fs_ready;
+ extern int n_roweb, n_rwweb;
+ extern void openLiveWebURL (const char *url);
+ extern void openLiveWebURLEmbedded (const char *url);
++#if defined(__EMSCRIPTEN__)
++extern bool takeLiveWebURL (char *buf, size_t buf_len);
++#endif
+ extern void requestLiveWebPaste (void);
+ extern bool isLiveWebTouch (void);
+ 
+diff --git a/ESPHamClock/liveweb.cpp b/ESPHamClock/liveweb.cpp
+index 65eeaf9..5e189de 100644
+--- a/ESPHamClock/liveweb.cpp
++++ b/ESPHamClock/liveweb.cpp
+@@ -1058,6 +1058,27 @@ void openLiveWebURLEmbedded (const char *url)
+     pthread_mutex_unlock (&lw_url_lock);
+ }
+ 
++#if defined(__EMSCRIPTEN__)
++/* browser build: there is no Live Web client to poll for staged urls, so wasm_glue.cpp collects
++ * them here instead. If one is staged, copy it into buf as "open URL" or "embed URL", the same
++ * verbs sendURL() sends, clear it and return true; else return false.
++ */
++bool takeLiveWebURL (char *buf, size_t buf_len)
++{
++    bool got = false;
++    pthread_mutex_lock (&lw_url_lock);
++    if (liveweb_openurl) {
++        snprintf (buf, buf_len, "%s%s", liveweb_openurl_embed ? "embed " : "open ", liveweb_openurl);
++        free (liveweb_openurl);
++        liveweb_openurl = NULL;
++        liveweb_openurl_embed = false;
++        got = true;
++    }
++    pthread_mutex_unlock (&lw_url_lock);
++    return (got);
++}
++#endif
++
+ /* record desire for most recent touch client to paste from clipboard.
+  */
+ void requestLiveWebPaste (void)
+diff --git a/ESPHamClock/qrz.cpp b/ESPHamClock/qrz.cpp
+index fe2c60c..1a62160 100644
+--- a/ESPHamClock/qrz.cpp
++++ b/ESPHamClock/qrz.cpp
+@@ -144,7 +144,13 @@ void openURLPopup (const char *url)
+  */
+ void openURLPopupEmbed (const char *url)
+ {
++#if defined(__EMSCRIPTEN__)
++    // browser build: the page itself is the browser, so every request goes to it the same way a
++    // Live Web touch's does, whether it came from a tap or the keyboard (see wasm_glue.cpp)
++    if (true) {
++#else
+     if (isLiveWebTouch()) {
++#endif
+         openLiveWebURLEmbedded (url);
+         return;
+     }
+@@ -159,7 +165,12 @@ void openURLPopupEmbed (const char *url)
+  */
+ void openURL (const char *url)
+ {
++#if defined(__EMSCRIPTEN__)
++    // browser build: no system browser to launch; always hand the url to the page, as for Live Web
++    if (true) {
++#else
+     if (isLiveWebTouch()) {
++#endif
+ 
+         openLiveWebURL (url);
+ 
+diff --git a/ESPHamClock/wasm_glue.cpp b/ESPHamClock/wasm_glue.cpp
+index acc4e63..8dc6c70 100644
+--- a/ESPHamClock/wasm_glue.cpp
++++ b/ESPHamClock/wasm_glue.cpp
+@@ -8,6 +8,10 @@
+  * which deadlocks. So the page only appends events to a lock-free single-producer queue in shared
+  * memory, and an input thread here drains it and does exactly what liveweb.cpp does for a Live
+  * Web client.
++ *
++ * URLs go the other way through a one-entry slot: openURL() stages a url exactly as for a Live
++ * Web touch, the input thread moves it into url_slot, and the page takes it with hc_url_take() /
++ * hc_url_done(), again with atomics only.
+  */
+ 
+ #if defined(__EMSCRIPTEN__)
+@@ -51,10 +55,18 @@ static void dispatch (const HCEvent &e)
+     }
+ }
+ 
++// one staged url for the page, as "open URL" or "embed URL"; url_ready says url_slot is full
++static char url_slot[2048];
++static std::atomic<int> url_ready;
++
+ static void *inputThread (void *unused)
+ {
+     (void) unused;
+     for (;;) {
++        // hand over a staged url once the page has taken the previous one
++        if (url_ready.load (std::memory_order_acquire) == 0 && takeLiveWebURL (url_slot, sizeof(url_slot)))
++            url_ready.store (1, std::memory_order_release);
++
+         int h = ev_head.load (std::memory_order_relaxed);
+         while (h != ev_tail.load (std::memory_order_acquire)) {
+             dispatch (evq[h]);
+@@ -106,6 +118,18 @@ EMSCRIPTEN_KEEPALIVE int hc_event (int type, int a, int b, int c)
+     return (1);
+ }
+ 
++// return "open URL" or "embed URL" if openURL() has one for the page, else NULL.
++// the page must call hc_url_done() after copying it.
++EMSCRIPTEN_KEEPALIVE const char *hc_url_take (void)
++{
++    return (url_ready.load (std::memory_order_acquire) ? url_slot : NULL);
++}
++
++EMSCRIPTEN_KEEPALIVE void hc_url_done (void)
++{
++    url_ready.store (0, std::memory_order_release);
++}
++
+ } // extern "C"
+ 
+ #endif // __EMSCRIPTEN__
+-- 
+2.43.0
+

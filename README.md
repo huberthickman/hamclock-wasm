@@ -18,7 +18,7 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 - The real client, not a rewrite. These patches apply to `openhamclock/hamclock` at
   [`b9db5fb`](https://github.com/openhamclock/hamclock/commit/b9db5fbe519faf84ee1350019eadb8747f1cd1e1)
   (v4.34b99) and build its existing `_WEB_ONLY` variant with Emscripten.
-- The change is small: **500 lines added and 1 changed across 10 files**, in four patches. All code
+- The change is small: **559 lines added and 1 changed across 13 files**, in five patches. All code
   changes are inside `#if defined(__EMSCRIPTEN__)`, plus a new `hamclock-wasm` Makefile target.
   The native `hamclock-web-800x480` build has been checked with g++ after patching.
 - The backend protocol is unchanged. The client still sends its usual
@@ -29,7 +29,7 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 
 | | |
 |---|---|
-| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
+| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
 | **Tested on** | Chrome on macOS against live ohb.hamclock.app; headless Chromium on Linux (all sizes, local backend) |
 | **Not tested** | Safari (including iPad), Firefox, a direct cross-origin connection to OHB |
 | **Not available** | Anything that needs raw TCP or UDP: DX cluster, APRS-IS, HamAlert, rigctld, flrig, rotctld, gpsd, WSJT-X UDP. Also the RESTful API and Live Web servers (a page can't listen on ports), OTA upgrade, and I2C/GPIO sensors |
@@ -103,6 +103,7 @@ in a database named `/home/web_user/.hamclock`. Nothing is written to a file on 
  index.html                                  setup() / loop() as on Linux
    draw: canvas ◄── shared wasm memory ◄──── _WEB_ONLY stage framebuffer (fbThread)
    input: events ──► lock-free queue ──────► input thread → setMouse / wifi_tt / putChar
+   links: new tab ◄──── one-entry url slot ◄─ input thread ◄─ openURL() (as for Live Web)
                                              WiFiClient::connect(backend_host, 80)
                                                write()  → collect the HTTP/1.0 request
                                                read()   → emscripten_fetch (sync) ──► OHB
@@ -121,6 +122,9 @@ in a database named `/home/web_user/.hamclock`. Nothing is written to a file on 
   `<canvas>`, only when a frame counter says something changed.
 - **Input:** the page never calls into HamClock directly (that can deadlock). Events go into a
   lock-free queue, and an input thread applies them exactly the way `liveweb.cpp` does.
+- **Links:** `openURL()` hands URLs to the page the way it does for a Live Web client. The page
+  opens a new tab, or an in-page overlay for sites known to allow framing. If the browser won't
+  open a tab because the tap was too long ago, a bar offers the link to click instead.
 - **Storage:** `~/.hamclock` (the settings file and cached maps) lives in IndexedDB.
 
 HamClock's log (`-o`) goes to the browser's DevTools console, so you can watch it work. This
@@ -141,9 +145,10 @@ hamclock-wasm/
 │   ├── 0001-WiFiClient-perform-HTTP-with-the-Emscripten-Fetch-AP.patch
 │   ├── 0002-Platform-stubs-for-Emscripten-builds.patch
 │   ├── 0003-Expose-web-only-framebuffer-and-input-to-a-browser-h.patch
-│   └── 0004-Makefile-add-hamclock-wasm-target.patch
+│   ├── 0004-Makefile-add-hamclock-wasm-target.patch
+│   └── 0005-Hand-openURL-requests-to-the-browser-page.patch
 ├── web/
-│   ├── index.html              host page: canvas, input, storage, configuration
+│   ├── index.html              host page: canvas, input, links, storage, configuration
 │   └── devserver.py            local server: COOP/COEP headers + /ohb proxy (stdlib only)
 ├── scripts/
 │   └── build.sh                clone upstream, apply patches, build, collect dist/<size>/
@@ -161,6 +166,7 @@ hamclock-wasm/
 | 0002 | `ESP8266WiFi.cpp`, `Arduino.cpp`, `setup.cpp`, `ESPHamClock.cpp` | Platform stubs: WiFi status, local IP, OS time instead of NTP, loop pacing without `getrusage()`, status-line text |
 | 0003 | `Adafruit_RA8875.{h,cpp}`, new `wasm_glue.cpp` | Framebuffer access and frame counter for the page; lock-free input queue and input thread |
 | 0004 | `Makefile` | `hamclock-wasm` target with `WASM_SIZE`, automatic clean when the size changes |
+| 0005 | `qrz.cpp`, `liveweb.cpp`, `HamClock.h`, `wasm_glue.cpp` | `openURL()` always stages URLs as for Live Web; the input thread passes them to the page through a lock-free slot |
 
 To read them as commits rather than patch files:
 `git am patches/*.patch` on a branch at `b9db5fb`.
