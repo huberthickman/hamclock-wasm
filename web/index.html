@@ -67,6 +67,17 @@ if (BACKEND_BASE === '/') BACKEND_BASE = location.origin;   // "/" + "/ham/..." 
 BACKEND_BASE = BACKEND_BASE.replace(/\/+$/, '');
 const APPDIR = '/home/web_user/.hamclock';
 
+// restarts: HamClock asks for one with -K (skip the startup countdown) and/or -0 (restore default
+// settings), as it would re-run itself natively. Those are carried across the reload in
+// sessionStorage, read once and removed, so they never end up in the URL: a bookmarked or reloaded
+// "?args=-0" would wipe the settings every time.
+const RESTART_KEY = 'hamclock-restart-args';
+let restartArgs = [];
+try {
+  restartArgs = (sessionStorage.getItem(RESTART_KEY) || '').split(' ').filter(Boolean);
+  sessionStorage.removeItem(RESTART_KEY);
+} catch (e) {}
+
 const canvas = document.getElementById('screen');
 const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
@@ -92,9 +103,10 @@ var Module = {
       // -o: log to the console instead of a file
       // -b: backend, as on the native command line
       Module.callMain(['-b', BACKEND_HOST, '-e', '-1', '-r', '-1', '-w', '-1', '-o',
-                       ...(params.get('args') ? params.get('args').split(' ') : [])]);
+                       ...(params.get('args') ? params.get('args').split(' ') : []),
+                       ...restartArgs]);
       Module._hc_input_start();
-      setInterval(pollURL, 100);
+      setInterval(() => { pollURL(); pollRestart(); }, 100);
       requestAnimationFrame(draw);
       setInterval(() => FS.syncfs(false, (e) => e && console.warn('IDBFS save', e)), 30000);
       addEventListener('pagehide', () => FS.syncfs(false, () => {}));
@@ -173,6 +185,25 @@ canvas.addEventListener('keydown', (e) => {
   event(HCE_KEY, c, e.ctrlKey ? 1 : 0, e.shiftKey ? 1 : 0);
   e.preventDefault();
 });
+
+// restart: doReboot() raised hc_restart_req (see wasm_glue.cpp). Save ~/.hamclock first: HamClock
+// may have just written new settings, eg after restoring a saved configuration.
+const RESTART_K = 2, RESTART_0 = 4;
+let restarting = false;
+function pollRestart() {
+  const r = Module._hc_restart_req();
+  if (!r || restarting) return;
+  restarting = true;
+  const args = [];
+  if (r & RESTART_K) args.push('-K');
+  if (r & RESTART_0) args.push('-0');
+  try { sessionStorage.setItem(RESTART_KEY, args.join(' ')); } catch (e) {}
+  status('restarting…');
+  Module.FS.syncfs(false, (err) => {
+    if (err) console.warn('IDBFS save before restart', err);
+    location.reload();
+  });
+}
 
 // links: HamClock's openURL() hands urls to this page through wasm memory (see wasm_glue.cpp), as
 // "open URL" for a new tab or "embed URL" for the in-page overlay, used for sites known to allow

@@ -179,6 +179,50 @@ directly; the same taps fired with no user activation showed the bar, and its Op
 the right URL; and a cross-origin page with no COEP headers loaded in the overlay while the page
 stayed cross-origin isolated.
 
+## Restarts (patch 0006)
+
+Natively, `doReboot()` calls `ESP::restart()`, which re-executes HamClock with the same arguments,
+adding `-K` (skip the startup countdown) and/or `-0` (restore default settings) when asked. A
+program can't re-execute itself in a browser: `execvp()` fails and HamClock exits, leaving the
+page frozen on its last frame. HamClock restarts itself in several places that stay visible in
+the browser build: restoring a saved configuration, "Reset to default configuration", and the
+fatal-error screen's restart button.
+
+So in the browser build, `doReboot()` calls `wasmRestart()` in `wasm_glue.cpp`, which:
+
+1. raises `restart_req` (atomic), with bits for `-K` and `-0`;
+2. waits forever, like `ESP::restart()`, which never returns either.
+
+The page checks `hc_restart_req()` every 100 ms. When it's set, the page:
+
+1. stores the `-K`/`-0` arguments in `sessionStorage`;
+2. saves `~/.hamclock` to IndexedDB with `FS.syncfs()` and waits for it to finish, since HamClock
+   may have just written new settings, for example a restored configuration;
+3. reloads.
+
+On load, the page reads the stored arguments, removes them, and appends them to `callMain()`.
+They deliberately never go in the URL: a bookmarked or manually reloaded `?args=-0` would reset
+the settings every time.
+
+The user can also restart simply by reloading the page. The only differences: a manual reload
+relies on the asynchronous save when the page closes (see [Storage](#storage)), and shows the
+startup countdown.
+
+**Menu items left out at compile time.** The `hamclock-wasm` target builds with:
+
+| Define | Removes | Why |
+|---|---|---|
+| `NO_UPGRADE` | the new-version check and upgrade prompt | upgrading downloads with curl and re-executes |
+| `NO_SYSTEM_CONTROLS` | Reboot computer, Shutdown computer | a page can't control the computer |
+| `NO_HAMCLOCK_CONTROLS` | Restart, Exit and Factory reset HamClock | reloading the page restarts; a page can't exit; clearing site data resets |
+
+The Android build sets the first two; it implements restart and exit natively.
+
+Tested in headless Chromium: restoring a saved configuration reloaded the page and the next start
+received `-K` and skipped Setup; "Reset to default configuration" reloaded with `-K -0` and showed
+Setup with default settings; a manual reload afterwards received neither flag; and
+`sessionStorage` was empty after each restart.
+
 ## Platform stubs (patch 0002)
 
 | Native behavior | Browser build |
@@ -232,7 +276,7 @@ print. `hamclock.js` supplies all of that:
   response into wasm memory.
 - **Exposes the API the page uses.** `Module.callMain`, `Module.FS`, `Module.HEAPU8`,
   `Module.ENV`, and the exported C functions such as `Module._hc_fb_pixels`,
-  `Module._hc_fb_frames`, `Module._hc_event` and `Module._hc_url_take`.
+  `Module._hc_fb_frames`, `Module._hc_event`, `Module._hc_url_take` and `Module._hc_restart_req`.
 
 Never edit `hamclock.js`, because the next build overwrites it. Changes go in the C++ (the
 request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makefile, or
@@ -259,6 +303,10 @@ request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makef
 | `-lidbfs.js` | Persistent `~/.hamclock` |
 | `-sFETCH -sFETCH_SUPPORT_INDEXEDDB=0` | Emscripten's Fetch API for `WiFiClient`, without its IndexedDB cache |
 | `-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,…` | What `index.html` uses |
+
+The compile step also gets `-D_WEB_ONLY`, the size's `-D_CLOCK_WxH`, and the three `NO_*` defines
+described under [Restarts](#restarts-patch-0006). The Makefile records the size and defines in
+`.wasm-size` and cleans the tree whenever they change, because object files don't record them.
 
 Sizes with Emscripten 3.1.51 and LLVM 18: the wasm is 9 to 10 MB with HamClock's default `-g`.
 After `wasm-opt --strip-debug -O2` it's 1.7 MB (800x480) to 1.9 MB (1600x960), or about

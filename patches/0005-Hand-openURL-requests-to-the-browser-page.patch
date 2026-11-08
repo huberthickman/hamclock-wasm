@@ -1,7 +1,7 @@
-From a386582026b094df7c4778957445222fc9fdb449 Mon Sep 17 00:00:00 2001
+From 484ba455aea384eccbebe53d359772569109aa19 Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
 Date: Sat, 7 Nov 2026 19:36:28 -0600
-Subject: [PATCH 5/5] Hand openURL() requests to the browser page
+Subject: [PATCH 5/6] Hand openURL() requests to the browser page
 
 The browser build has no system browser to launch, so openURL() and
 openURLPopupEmbed() always stage the url the way they already do for a

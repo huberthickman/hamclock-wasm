@@ -1,7 +1,7 @@
 From 737328640566545390cdb78f4180e85b055935b9 Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
 Date: Sun, 1 Nov 2026 23:41:49 -0600
-Subject: [PATCH 1/5] WiFiClient: perform HTTP with the Emscripten Fetch API in
+Subject: [PATCH 1/6] WiFiClient: perform HTTP with the Emscripten Fetch API in
  browser builds
 
 Browsers cannot open raw TCP sockets. In __EMSCRIPTEN__ builds, connect()

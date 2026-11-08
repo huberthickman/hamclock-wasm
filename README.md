@@ -18,7 +18,7 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 - The real client, not a rewrite. These patches apply to `openhamclock/hamclock` at
   [`b9db5fb`](https://github.com/openhamclock/hamclock/commit/b9db5fbe519faf84ee1350019eadb8747f1cd1e1)
   (v4.34b99) and build its existing `_WEB_ONLY` variant with Emscripten.
-- The change is small: **559 lines added and 1 changed across 13 files**, in five patches. All code
+- The change is small: **598 lines added and 2 changed across 13 files**, in six patches. All code
   changes are inside `#if defined(__EMSCRIPTEN__)`, plus a new `hamclock-wasm` Makefile target.
   The native `hamclock-web-800x480` build has been checked with g++ after patching.
 - The backend protocol is unchanged. The client still sends its usual
@@ -29,10 +29,10 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 
 | | |
 |---|---|
-| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
+| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); restarts HamClock asks for, such as restoring a saved configuration; settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
 | **Tested on** | Chrome on macOS against live ohb.hamclock.app; headless Chromium on Linux (all sizes, local backend) |
 | **Not tested** | Safari (including iPad), Firefox, a direct cross-origin connection to OHB |
-| **Not available** | Anything that needs raw TCP or UDP: DX cluster, APRS-IS, HamAlert, rigctld, flrig, rotctld, gpsd, WSJT-X UDP. Also the RESTful API and Live Web servers (a page can't listen on ports), OTA upgrade, and I2C/GPIO sensors |
+| **Not available** | Anything that needs raw TCP or UDP: DX cluster, APRS-IS, HamAlert, rigctld, flrig, rotctld, gpsd, WSJT-X UDP. Also the RESTful API and Live Web servers (a page can't listen on ports), I2C/GPIO sensors, and the menu items a browser can't honor: upgrade, Reboot/Shutdown computer, and Restart/Exit/Factory reset HamClock (reload the page to restart; clear site data to reset) |
 
 ## Try it
 
@@ -125,6 +125,8 @@ in a database named `/home/web_user/.hamclock`. Nothing is written to a file on 
 - **Links:** `openURL()` hands URLs to the page the way it does for a Live Web client. The page
   opens a new tab, or an in-page overlay for sites known to allow framing. If the browser won't
   open a tab because the tap was too long ago, a bar offers the link to click instead.
+- **Restarts:** HamClock can't re-run itself in a browser, so when it needs to restart (restoring
+  a saved configuration, resetting to defaults), it asks the page to save settings and reload.
 - **Storage:** `~/.hamclock` (the settings file and cached maps) lives in IndexedDB.
 
 HamClock's log (`-o`) goes to the browser's DevTools console, so you can watch it work. This
@@ -146,7 +148,8 @@ hamclock-wasm/
 │   ├── 0002-Platform-stubs-for-Emscripten-builds.patch
 │   ├── 0003-Expose-web-only-framebuffer-and-input-to-a-browser-h.patch
 │   ├── 0004-Makefile-add-hamclock-wasm-target.patch
-│   └── 0005-Hand-openURL-requests-to-the-browser-page.patch
+│   ├── 0005-Hand-openURL-requests-to-the-browser-page.patch
+│   └── 0006-Restart-by-reloading-the-browser-page.patch
 ├── web/
 │   ├── index.html              host page: canvas, input, links, storage, configuration
 │   └── devserver.py            local server: COOP/COEP headers + /ohb proxy (stdlib only)
@@ -165,8 +168,9 @@ hamclock-wasm/
 | 0001 | `ArduinoLib/WiFiClient.{h,cpp}` | HTTP through the Emscripten Fetch API: request collection, synchronous `emscripten_fetch()`, response rebuilding, curl-pipe URLs, `HC_BACKEND_BASE` redirect, `X-HamClock-UA` |
 | 0002 | `ESP8266WiFi.cpp`, `Arduino.cpp`, `setup.cpp`, `ESPHamClock.cpp` | Platform stubs: WiFi status, local IP, OS time instead of NTP, loop pacing without `getrusage()`, status-line text |
 | 0003 | `Adafruit_RA8875.{h,cpp}`, new `wasm_glue.cpp` | Framebuffer access and frame counter for the page; lock-free input queue and input thread |
-| 0004 | `Makefile` | `hamclock-wasm` target with `WASM_SIZE`, automatic clean when the size changes |
+| 0004 | `Makefile` | `hamclock-wasm` target with `WASM_SIZE`; builds with `NO_UPGRADE`, `NO_SYSTEM_CONTROLS` and `NO_HAMCLOCK_CONTROLS`; automatic clean when the size or those defines change |
 | 0005 | `qrz.cpp`, `liveweb.cpp`, `HamClock.h`, `wasm_glue.cpp` | `openURL()` always stages URLs as for Live Web; the input thread passes them to the page through a lock-free slot |
+| 0006 | `ESPHamClock.cpp`, `HamClock.h`, `wasm_glue.cpp` | `doReboot()` asks the page to save settings and reload, carrying `-K`/`-0` to the next start |
 
 To read them as commits rather than patch files:
 `git am patches/*.patch` on a branch at `b9db5fb`.
@@ -198,7 +202,8 @@ To read them as commits rather than patch files:
 - `labs(time_t)` and `%ld` with `time_t` in `astro.cpp`, `liveweb.cpp` and `ESPHamClock.cpp` warn
   on wasm32, where `long` is 32 bits. They're harmless here, but could be fixed upstream for any
   32-bit target.
-- The first build after a size change or a native build does a full rebuild, on purpose.
+- The first build after a size change, a change to the compile-time defines, or a native build does a
+  full rebuild, on purpose.
 - Settings are saved to IndexedDB every 30 seconds and on close, not immediately after HamClock
   writes them (see [Where settings live](#where-settings-live)).
 
