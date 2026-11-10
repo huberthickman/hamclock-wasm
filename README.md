@@ -228,4 +228,4 @@ community keeps the data flowing.
 This repository is MIT licensed, like upstream HamClock. The patches modify upstream's
 MIT-licensed files, whose copyright notices still apply.
 
-Hubert Hickman, KV0VWD
+Hubert Hickman, KF0VWD
