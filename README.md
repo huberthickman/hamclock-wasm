@@ -18,7 +18,7 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 - The real client, not a rewrite. These patches apply to `openhamclock/hamclock` at
   [`b9db5fb`](https://github.com/openhamclock/hamclock/commit/b9db5fbe519faf84ee1350019eadb8747f1cd1e1)
   (v4.34b99) and build its existing `_WEB_ONLY` variant with Emscripten.
-- The change is small: **598 lines added and 2 changed across 13 files**, in six patches. All code
+- The change is small: **673 lines added and 2 changed across 13 files**, in seven patches. All code
   changes are inside `#if defined(__EMSCRIPTEN__)`, plus a new `hamclock-wasm` Makefile target.
   The native `hamclock-web-800x480` build has been checked with g++ after patching.
 - The backend protocol is unchanged. The client still sends its usual
@@ -29,7 +29,7 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 
 | | |
 |---|---|
-| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); restarts HamClock asks for, such as restoring a saved configuration; settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
+| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); restarts HamClock asks for, such as restoring a saved configuration; the hams.at Sat Alerts and Meshtastic Mesh Mon panes, including a hams.at API key, through `devserver.py`'s proxy; settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
 | **Tested on** | Chrome on macOS against live ohb.hamclock.app; headless Chromium on Linux (all sizes, local backend) |
 | **Not tested** | Safari (including iPad), Firefox, a direct cross-origin connection to OHB |
 | **Not available** | Anything that needs raw TCP or UDP: DX cluster, APRS-IS, HamAlert, rigctld, flrig, rotctld, gpsd, WSJT-X UDP. Also the RESTful API and Live Web servers (a page can't listen on ports), I2C/GPIO sensors, and the menu items a browser can't honor: upgrade, Reboot/Shutdown computer, and Restart/Exit/Factory reset HamClock (reload the page to restart; clear site data to reset) |
@@ -62,8 +62,10 @@ repo's tag (override with `VERSION=`). Anyone who downloads a zip still needs to
 `python3 devserver.py` from inside it: opening `index.html` directly won't work.
 
 `build.sh` clones upstream at the pinned commit, applies `patches/`, builds and copies the page
-into `dist/<size>/`. `devserver.py` serves it with the headers the browser needs and forwards
-`/ohb/*` to `http://ohb.hamclock.app`.
+into `dist/<size>/`. `devserver.py` serves it with the headers the browser needs, forwards
+`/ohb/*` to `http://ohb.hamclock.app`, and forwards `/xhttp/*` to the two third-party APIs HamClock
+uses that browsers can't reach directly (see [Third-party APIs](#third-party-apis)). It listens on
+`localhost` only; `python3 devserver.py --help` lists its options.
 
 `dist/<size>/` then contains:
 
@@ -83,6 +85,8 @@ You can change the defaults in the URL:
 - `?b=host:port` sets HamClock's `-b` backend. The default is `ohb.hamclock.app:80`.
 - `?backend=` sets where requests actually go: `/ohb` (the dev proxy), `/` (the page is served by
   the backend itself), or `https://host` (a server with CORS enabled).
+- `?xhttp=` sets where third-party APIs are fetched through: `/xhttp` (the default, via
+  `devserver.py`) or empty, to fetch them straight from the browser.
 - `?args=` passes extra HamClock command-line arguments.
 
 ## Where settings live
@@ -105,6 +109,27 @@ in a database named `/home/web_user/.hamclock`. Nothing is written to a file on 
 - **There's no import or export yet.** The `eeprom` format is the same as the native client's,
   so a download/upload button could move a configuration between the desktop app and the
   browser.
+
+## Third-party APIs
+
+Two of HamClock's panes fetch data from services other than OHB, using curl natively:
+
+| Pane | Service | Key |
+|---|---|---|
+| Sat Alerts | `https://hams.at/api/alerts/upcoming` | optional hams.at API key (Setup page 4) |
+| Mesh Mon | `https://meshtastic.liamcottle.net/api/v1/nodes/…` | none; node IDs from Setup page 4 |
+
+Neither service sends CORS headers, so browsers refuse to let a page on another site read their
+responses. The page fetches them through `devserver.py` instead: `https://hams.at/api/...` becomes
+`/xhttp/hams.at/api/...` on the page's own server, which forwards it with your API key and
+HamClock's user agent.
+
+- **Only those two hosts are forwarded.** Add others with `--xhttp-allow HOST`, or turn the proxy
+  off with `--no-xhttp`.
+- **Only this page can use it.** Requests must carry an `X-HamClock-Proxy` header, which other
+  websites can't send without the browser asking first, and must be addressed to this server,
+  which blocks DNS-rebinding tricks. Anything else gets a 403 with the reason in the log.
+- **Your API key is forwarded, never logged.** The log only notes that a key was present.
 
 ## How it works
 
@@ -136,6 +161,8 @@ in a database named `/home/web_user/.hamclock`. Nothing is written to a file on 
 - **Links:** `openURL()` hands URLs to the page the way it does for a Live Web client. The page
   opens a new tab, or an in-page overlay for sites known to allow framing. If the browser won't
   open a tab because the tap was too long ago, a bar offers the link to click instead.
+- **Third-party APIs:** hams.at and the Meshtastic map don't allow requests from other websites,
+  so the page fetches them through `devserver.py`'s `/xhttp/` proxy, with your hams.at API key.
 - **Restarts:** HamClock can't re-run itself in a browser, so when it needs to restart (restoring
   a saved configuration, resetting to defaults), it asks the page to save settings and reload.
 - **Storage:** `~/.hamclock` (the settings file and cached maps) lives in IndexedDB.
@@ -160,10 +187,11 @@ hamclock-wasm/
 │   ├── 0003-Expose-web-only-framebuffer-and-input-to-a-browser-h.patch
 │   ├── 0004-Makefile-add-hamclock-wasm-target.patch
 │   ├── 0005-Hand-openURL-requests-to-the-browser-page.patch
-│   └── 0006-Restart-by-reloading-the-browser-page.patch
+│   ├── 0006-Restart-by-reloading-the-browser-page.patch
+│   └── 0007-Fetch-third-party-https-APIs-through-the-page-s-prox.patch
 ├── web/
 │   ├── index.html              host page: canvas, input, links, storage, configuration
-│   └── devserver.py            local server: COOP/COEP headers + /ohb proxy (stdlib only)
+│   └── devserver.py            local server: COOP/COEP headers, /ohb and /xhttp proxies (stdlib only)
 ├── scripts/
 │   ├── build.sh                clone upstream, apply patches, build, collect dist/<size>/
 │   └── build_all.sh            build.sh for every size, optionally zipped for a release
@@ -183,6 +211,7 @@ hamclock-wasm/
 | 0004 | `Makefile` | `hamclock-wasm` target with `WASM_SIZE`; builds with `NO_UPGRADE`, `NO_SYSTEM_CONTROLS` and `NO_HAMCLOCK_CONTROLS`; automatic clean when the size or those defines change |
 | 0005 | `qrz.cpp`, `liveweb.cpp`, `HamClock.h`, `wasm_glue.cpp` | `openURL()` always stages URLs as for Live Web; the input thread passes them to the page through a lock-free slot |
 | 0006 | `ESPHamClock.cpp`, `HamClock.h`, `wasm_glue.cpp` | `doReboot()` asks the page to save settings and reload, carrying `-K`/`-0` to the next start |
+| 0007 | `ArduinoLib/WiFiClient.{h,cpp}` | curl commands keep their `-A` and `-H` headers (the hams.at API key); third-party https goes through the page's `/xhttp/` proxy |
 
 To read them as commits rather than patch files:
 `git am patches/*.patch` on a branch at `b9db5fb`.
@@ -198,7 +227,11 @@ To read them as commits rather than patch files:
    puts in `User-Agent`? `version.pl` parses that string.
 4. **Raw-TCP features.** Is the DX cluster worth a WebSocket-to-TCP relay with a destination
    allowlist, or is it out of scope for a browser client?
-5. **Anything else that depends on the client?** I know about `fetchIPGeoloc.pl` (`REMOTE_ADDR`)
+5. **Third-party APIs.** hams.at and the Meshtastic map API send no CORS headers, so a hosted
+   copy of this page would have to proxy them, and a proxy sees users' hams.at API keys. Would
+   it be worth asking both to allow cross-origin requests? See
+   [docs/OHB-BACKEND.md](docs/OHB-BACKEND.md#third-party-apis).
+6. **Anything else that depends on the client?** I know about `fetchIPGeoloc.pl` (`REMOTE_ADDR`)
    and the `wx.pl` per-IP rate limit. Are there other endpoints that care about the client IP or
    User-Agent?
 
@@ -228,4 +261,4 @@ community keeps the data flowing.
 This repository is MIT licensed, like upstream HamClock. The patches modify upstream's
 MIT-licensed files, whose copyright notices still apply.
 
-Hubert Hickman, KF0VWD
+Hubert Hickman, KV0VWD

@@ -56,15 +56,22 @@
 //     '/ohb'              a same-origin proxy prefix, as devserver.py provides
 //     '/'                 this page is served by the backend itself (same origin, no CORS needed)
 //     'https://host'      another server; works only if it sends CORS headers (docs/OHB-BACKEND.md)
+//   DEFAULT_XHTTP_BASE    where third-party https APIs that don't allow cross-origin requests
+//                         (hams.at, the Meshtastic map) are fetched through:
+//     '/xhttp'            this page's server, as devserver.py provides: /xhttp/hams.at/...
+//     ''                  straight from the browser (only works for APIs that send CORS headers)
 const DEFAULT_BACKEND_HOST = 'ohb.hamclock.app:80';
 const DEFAULT_BACKEND_BASE = '/ohb';
+const DEFAULT_XHTTP_BASE = '/xhttp';
 
-// All overridable in the URL: ?b=host:port  ?backend=/ohb|/|https://host  ?args=extra+hamclock+args
+// All overridable in the URL: ?b=host:port  ?backend=/ohb|/|https://host  ?xhttp=/xhttp|(empty)
+//                              ?args=extra+hamclock+args
 const params = new URLSearchParams(location.search);
 const BACKEND_HOST = params.get('b') || DEFAULT_BACKEND_HOST;
 let BACKEND_BASE = params.get('backend') || DEFAULT_BACKEND_BASE;
 if (BACKEND_BASE === '/') BACKEND_BASE = location.origin;   // "/" + "/ham/..." would be protocol-relative
 BACKEND_BASE = BACKEND_BASE.replace(/\/+$/, '');
+const XHTTP_BASE = (params.has('xhttp') ? params.get('xhttp') : DEFAULT_XHTTP_BASE).replace(/\/+$/, '');
 const APPDIR = '/home/web_user/.hamclock';
 
 // restarts: HamClock asks for one with -K (skip the startup countdown) and/or -0 (restore default
@@ -90,6 +97,7 @@ var Module = {
   printErr: (t) => console.warn(t),
   preRun: [() => {
     Module.ENV.HC_BACKEND_BASE = BACKEND_BASE;
+    if (XHTTP_BASE) Module.ENV.HC_XHTTP_BASE = XHTTP_BASE;
   }],
   onRuntimeInitialized: () => {
     // persist ~/.hamclock (settings "EEPROM", cached maps) in IndexedDB

@@ -1,0 +1,238 @@
+From 7a6283c0ce7d7d7910ef21f162bea4ddef6965f7 Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sun, 8 Nov 2026 00:27:46 -0600
+Subject: [PATCH 7/7] Fetch third-party https APIs through the page's proxy,
+ with curl's headers
+
+hams.at (Sat Alerts) and the Meshtastic map API (Mesh Mon) are fetched with
+curl through connectCommand(). The browser build used to take only the URL
+from the curl command, which silently dropped the hams.at API key, and
+fetched it straight from the browser, which both APIs refuse: neither sends
+CORS headers.
+
+Now connectCommand() splits the command like a shell and keeps the URL, the
+-A user agent and any -H headers. When the page sets HC_XHTTP_BASE (eg
+"/xhttp"), https://host/path is fetched as HC_XHTTP_BASE/host/path from the
+page's own server instead, with the -H headers (so the API key arrives),
+the user agent as X-HamClock-UA, and X-HamClock-Proxy, which that server
+requires before it will forward anything. https to backend_host goes to
+HC_BACKEND_BASE like plain http does.
+
+All changes are inside #if __EMSCRIPTEN__.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/ArduinoLib/WiFiClient.cpp | 114 +++++++++++++++++++++-----
+ ESPHamClock/ArduinoLib/WiFiClient.h   |   1 +
+ 2 files changed, 95 insertions(+), 20 deletions(-)
+
+diff --git a/ESPHamClock/ArduinoLib/WiFiClient.cpp b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+index 8d3b922..ef7e0e6 100644
+--- a/ESPHamClock/ArduinoLib/WiFiClient.cpp
++++ b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+@@ -8,6 +8,7 @@
+ 
+ #if defined(__EMSCRIPTEN__)
+ #include <string>
++#include <vector>
+ #include <strings.h>
+ #include <emscripten/fetch.h>
+ 
+@@ -26,6 +27,10 @@
+  *     HC_BACKEND_BASE environment variable, eg "/ohb" or "https://ohb.hamclock.app".
+  *   Browsers will not let a page set User-Agent, so HamClock's (telemetry-laden) UA line is
+  *     forwarded as X-HamClock-UA instead.
++ *   Third-party https APIs fetched with curl (hams.at, the Meshtastic map) don't allow cross-origin
++ *     requests, so when the page sets HC_XHTTP_BASE, eg "/xhttp", https://host/path is fetched
++ *     as HC_XHTTP_BASE/host/path from the page's own server instead, with curl's -H headers (such
++ *     as an API key) and X-HamClock-Proxy, which that server requires.
+  *   Browsers ignore timeouts on synchronous requests, so a server that accepts but never answers
+  *     holds this thread until the browser gives up.
+  */
+@@ -36,8 +41,10 @@ void WiFiClient::wasmReset()
+ {
+     if (m_req) free (m_req);
+     if (m_resp) free (m_resp);
++    if (m_xhdrs) free (m_xhdrs);
+     m_req = nullptr;
+     m_resp = nullptr;
++    m_xhdrs = nullptr;
+     m_req_len = m_req_max = 0;
+     m_resp_len = m_resp_pos = 0;
+     m_isHttp = m_bodyOnly = m_fetched = false;
+@@ -78,11 +85,40 @@ bool WiFiClient::wasmPerform()
+     m_fetched = true;
+ 
+     // build the URL and pick out the request headers worth forwarding
++    std::vector<std::string> hdrs;              // extra request headers: name, value, name, value...
+     std::string url, ims, ua;
+     if (!m_host[0]) {
+ 
+-        // curl mode: m_req is the bare URL
++        // curl mode: m_req is the URL, m_xhdrs the -A and -H headers from the command line
+         url = m_req ? m_req : "";
++        if (m_xhdrs)
++            forEachHeader (std::string (m_xhdrs), 0, [&](const std::string &name, const std::string &value,
++                                                                            const std::string &) {
++                if (strcasecmp (name.c_str(), "User-Agent") == 0)
++                    ua = value;
++                else {
++                    hdrs.push_back (name);
++                    hdrs.push_back (value);
++                }
++            });
++
++        // https to backend_host goes to the backend base like plain http does. Other https hosts
++        // don't allow cross-origin requests, so they go through the page's proxy if it has one.
++        if (url.compare (0, 8, "https://") == 0) {
++            std::string hostpath = url.substr (8);
++            std::string host = hostpath.substr (0, hostpath.find_first_of ("/:?"));
++            size_t slash = hostpath.find ('/');
++            std::string path = slash == std::string::npos ? "/" : hostpath.substr (slash);
++            const char *be = getenv ("HC_BACKEND_BASE");
++            const char *xb = getenv ("HC_XHTTP_BASE");
++            if (be && be[0] && host == backend_host) {
++                url = std::string (be) + path;
++            } else if (xb && xb[0]) {
++                url = std::string (xb) + "/" + hostpath;
++                hdrs.push_back ("X-HamClock-Proxy");
++                hdrs.push_back ("1");
++            }
++        }
+ 
+     } else {
+ 
+@@ -122,17 +158,18 @@ bool WiFiClient::wasmPerform()
+     }
+ 
+     // name/value pairs, NULL terminated
+-    const char *headers[5];
+-    int n_h = 0;
+     if (!ims.empty()) {
+-        headers[n_h++] = "If-Modified-Since";
+-        headers[n_h++] = ims.c_str();
++        hdrs.push_back ("If-Modified-Since");
++        hdrs.push_back (ims);
+     }
+     if (!ua.empty()) {
+-        headers[n_h++] = "X-HamClock-UA";
+-        headers[n_h++] = ua.c_str();
++        hdrs.push_back ("X-HamClock-UA");
++        hdrs.push_back (ua);
+     }
+-    headers[n_h] = NULL;
++    std::vector<const char *> headers;
++    for (const std::string &h : hdrs)
++        headers.push_back (h.c_str());
++    headers.push_back (NULL);
+ 
+     // perform, blocking this thread. REPLACE skips the IndexedDB lookup the Fetch API does by default;
+     // HamClock keeps its own cache in ~/.hamclock.
+@@ -140,7 +177,7 @@ bool WiFiClient::wasmPerform()
+     emscripten_fetch_attr_init (&attr);
+     strcpy (attr.requestMethod, "GET");
+     attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS | EMSCRIPTEN_FETCH_REPLACE;
+-    attr.requestHeaders = headers;
++    attr.requestHeaders = headers.data();
+     emscripten_fetch_t *f = emscripten_fetch (&attr, url.c_str());
+     if (!f) {
+         printf ("WiFiCl: GET %s: emscripten_fetch() refused\n", url.c_str());
+@@ -210,6 +247,7 @@ WiFiClient::WiFiClient()
+ #if defined(__EMSCRIPTEN__)
+     m_req = nullptr;
+     m_resp = nullptr;
++    m_xhdrs = nullptr;
+     wasmReset();
+ #endif
+ }
+@@ -229,6 +267,7 @@ WiFiClient::WiFiClient(int fd)
+ #if defined(__EMSCRIPTEN__)
+     m_req = nullptr;
+     m_resp = nullptr;
++    m_xhdrs = nullptr;
+     wasmReset();
+ #endif
+ }
+@@ -312,21 +351,56 @@ extern "C" bool android_connect_http(const char *cmd, int *read_fd);
+ bool WiFiClient::connectCommand(const char* command)
+ {
+ #if defined(__EMSCRIPTEN__)
+-    // no processes in a browser: pull the URL out of the curl command and fetch it directly.
+-    // curl prints only the body, so deliver it without headers.
++    // no processes in a browser: take the URL and any -A user agent and -H headers (eg an API
++    // key) from the curl command and fetch it directly. curl prints only the body, so deliver
++    // it without headers.
+     stop();
+-    const char *u = strstr (command, "https://");
+-    if (!u)
+-        u = strstr (command, "http://");
+-    if (!u)
++
++    // split like a shell: blanks separate words, "..." and '...' group them
++    std::vector<std::string> words;
++    std::string w;
++    bool in_word = false;
++    char quote = 0;
++    for (const char *c = command; *c; c++) {
++        if (quote) {
++            if (*c == quote)
++                quote = 0;
++            else
++                w += *c;
++        } else if (*c == '"' || *c == '\'') {
++            quote = *c;
++            in_word = true;
++        } else if (*c == ' ' || *c == '\t') {
++            if (in_word)
++                words.push_back (w);
++            w.clear();
++            in_word = false;
++        } else {
++            w += *c;
++            in_word = true;
++        }
++    }
++    if (in_word)
++        words.push_back (w);
++
++    std::string url, xhdrs;
++    for (size_t i = 0; i < words.size(); i++) {
++        if (words[i] == "-A" && i + 1 < words.size())
++            xhdrs += "User-Agent: " + words[++i] + "\r\n";
++        else if (words[i] == "-H" && i + 1 < words.size())
++            xhdrs += words[++i] + "\r\n";
++        else if (words[i].compare (0, 8, "https://") == 0 || words[i].compare (0, 7, "http://") == 0)
++            url = words[i];
++    }
++    if (url.empty())
+         return (false);
+-    int ul = strcspn (u, " \"'");
++
+     m_isHttp = true;
+     m_bodyOnly = true;
+-    m_req = (char *) malloc (ul + 1);
+-    memcpy (m_req, u, ul);
+-    m_req[ul] = '\0';
+-    m_req_len = m_req_max = ul;
++    m_req = strdup (url.c_str());
++    m_req_len = m_req_max = url.size();
++    if (!xhdrs.empty())
++        m_xhdrs = strdup (xhdrs.c_str());
+     socket = wasm_next_fd++;
+     n_peek = next_peek = 0;
+     return (true);
+diff --git a/ESPHamClock/ArduinoLib/WiFiClient.h b/ESPHamClock/ArduinoLib/WiFiClient.h
+index 34dd6d7..0bb30a5 100644
+--- a/ESPHamClock/ArduinoLib/WiFiClient.h
++++ b/ESPHamClock/ArduinoLib/WiFiClient.h
+@@ -90,6 +90,7 @@ private:
+     char m_host[128];                       // host as given to connect()
+     int m_port;                             // port as given to connect()
+     char *m_req;                            // accumulated request text
++    char *m_xhdrs;                          // curl mode: extra "Name: value\r\n" request headers
+     int m_req_len, m_req_max;
+     uint8_t *m_resp;                        // malloced synthesized response
+     int m_resp_len, m_resp_pos;
+-- 
+2.43.0
+

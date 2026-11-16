@@ -1,7 +1,7 @@
 From b0fd2389d5c8471c85fbfb8e8f91e69e78042f95 Mon Sep 17 00:00:00 2001
 From: Hubert Hickman <hubert.hickman@gmail.com>
 Date: Sat, 7 Nov 2026 20:53:16 -0600
-Subject: [PATCH 6/6] Restart by reloading the browser page
+Subject: [PATCH 6/7] Restart by reloading the browser page
 
 A program can't re-exec itself in a browser, so in Emscripten builds
 doReboot() calls the new wasmRestart() instead of ESP::restart(). It raises
