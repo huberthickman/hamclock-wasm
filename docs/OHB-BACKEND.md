@@ -108,6 +108,25 @@ forwards to OHB and turns `X-HamClock-UA` back into `User-Agent`. It needs nothi
 `wx.pl` per-IP limit (10 requests a minute) would be shared by everyone. It's fine on your own
 machine, but not for a public deployment.
 
+## Third-party APIs
+
+Two panes fetch from services other than OHB: hams.at (Sat Alerts, optionally with the user's
+hams.at API key) and the Meshtastic map API at meshtastic.liamcottle.net (Mesh Mon). Neither sends
+CORS headers, so a page can't read them directly. Locally, `devserver.py` forwards them through
+`/xhttp/<host>/...`.
+
+A copy of the page hosted on OHB would need one of:
+
+- **The same forwarding on the OHB host** (`/xhttp/hams.at/...` and
+  `/xhttp/meshtastic.liamcottle.net/...`, with an allowlist). It works, but OHB's server would then
+  see every user's hams.at API key, and every user would reach hams.at from OHB's IP address,
+  subject to whatever rate limits hams.at applies.
+- **CORS on the two APIs themselves** (better). If hams.at answered `OPTIONS` and sent
+  `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Headers: Authorization` on `/api/`,
+  and the Meshtastic map API sent `Access-Control-Allow-Origin: *`, the page could call them
+  directly (`?xhttp=` empty): no proxy, and no third party holding anyone's key. It may be worth
+  asking both operators.
+
 ## Open questions for OHB
 
 - Does the public `ohb.hamclock.app` serve HTTPS with a publicly trusted certificate? (The

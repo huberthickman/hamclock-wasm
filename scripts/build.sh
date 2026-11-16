@@ -51,6 +51,15 @@ for p in "$ROOT"/patches/*.patch; do
     git -C "$SRC" apply "$p"
 done
 
+# objects from an earlier build are reused only if the patches are unchanged: make doesn't track
+# header changes, so a patch that changes a class layout would otherwise mix old and new objects.
+# Removing the size stamp makes the Makefile clean before building.
+PATCH_SUM="$(cat "$ROOT"/patches/*.patch | cksum | tr -d ' ')"
+if [ "$(cat "$ROOT/build/.patch-sum" 2>/dev/null)" != "$PATCH_SUM" ]; then
+    rm -f "$SRC/ESPHamClock/.wasm-size"
+    echo "$PATCH_SUM" > "$ROOT/build/.patch-sum"
+fi
+
 # the sub-Makefiles call plain ar/ranlib, which (on macOS) can't index wasm objects.
 # Wrapper scripts, not symlinks: emar finds its python half by its own name.
 SHIM="$ROOT/build/emshim"

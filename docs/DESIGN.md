@@ -223,6 +223,55 @@ received `-K` and skipped Setup; "Reset to default configuration" reloaded with 
 Setup with default settings; a manual reload afterwards received neither flag; and
 `sessionStorage` was empty after each restart.
 
+## Third-party APIs (patch 0007)
+
+Two panes fetch from services other than the backend, with curl through `connectCommand()`:
+
+- **Sat Alerts:** `https://hams.at/api/alerts/upcoming`, with `-H "Authorization: Bearer <key>"`
+  when a hams.at API key is set. Without a key hams.at still answers, but leaves out the
+  personalized `match_percent` and `is_workable` fields.
+- **Mesh Mon:** `https://meshtastic.liamcottle.net/api/v1/nodes/<id>` and `/neighbours`, for the
+  node IDs in Setup's watch list.
+
+Neither service sends `Access-Control-Allow-Origin`, and hams.at answers the preflight that an
+`Authorization` header triggers with 404 (checked with curl, November 2026). So a browser can't
+read them from a page on any other site, with or without a key.
+
+**In the browser build:**
+
+1. `connectCommand()` splits the curl command like a shell (quotes group words) and keeps the
+   URL, `-A` (user agent) and every `-H` header. Before this, it kept only the URL, so the hams.at
+   key was silently dropped.
+2. When the page sets `HC_XHTTP_BASE` (default `/xhttp`), `https://host/path` is fetched as
+   `/xhttp/host/path` from the page's own server, with:
+   - the `-H` headers, so the key arrives;
+   - the user agent as `X-HamClock-UA`, which the server turns back into `User-Agent`;
+   - `X-HamClock-Proxy: 1`, which the server requires.
+3. https to `backend_host` goes to `HC_BACKEND_BASE`, like plain http.
+
+**The proxy in `devserver.py`** forwards `/xhttp/HOST/PATH` to `https://HOST/PATH`, only for
+allowlisted hosts (`hams.at`, `meshtastic.liamcottle.net`, plus any `--xhttp-allow`), passing on
+`Authorization` and the user agent. A forwarding proxy on `localhost` is an obvious target for
+other websites in the same browser, so it only accepts requests that:
+
+- carry `X-HamClock-Proxy`. Other websites can only send a custom header after a preflight, and
+  `devserver.py` refuses every preflight (`OPTIONS` gets 403);
+- are addressed to this server. The `Host` header must be `localhost`, `127.0.0.1` or `[::1]` on
+  its port (or an `--allow-host` name), which defeats DNS rebinding, where an attacker's domain
+  is pointed at `127.0.0.1`;
+- have no foreign `Origin`, and no `Sec-Fetch-Site` other than `same-origin`.
+
+`devserver.py` also now listens on `127.0.0.1` by default instead of every interface (`--bind` to
+change). Browsers only run the page from `localhost` or HTTPS anyway, so nothing that worked before
+is lost. The log notes whether an `Authorization` header was forwarded, never its value.
+
+Tested in headless Chromium against stand-ins for both services that send no CORS headers. With a
+key entered in Setup, Sat Alerts showed "(has key)" and match percentages, which the stand-in only
+returns for the right `Bearer` key. Mesh Mon fetched its node and plotted it. Both upstream
+requests carried `User-Agent: HamClock-UNIX/4.34b99`, and only hams.at's carried the key. Requests
+without the header, with a foreign `Host` or `Origin`, cross-site, to an unlisted host, or as a
+preflight were all refused.
+
 ## Platform stubs (patch 0002)
 
 | Native behavior | Browser build |
