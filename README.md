@@ -30,9 +30,16 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 | | |
 |---|---|
 | **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); restarts HamClock asks for, such as restoring a saved configuration; the hams.at Sat Alerts and Meshtastic Mesh Mon panes, including a hams.at API key, through `devserver.py`'s proxy; settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
-| **Tested on** | Chrome on macOS against live ohb.hamclock.app; headless Chromium on Linux (all sizes, local backend) |
-| **Not tested** | Safari (including iPad), Firefox, a direct cross-origin connection to OHB |
+| **Tested on** | Against live ohb.hamclock.app: Chrome on macOS, Firefox on macOS and Linux, Edge on Windows, Safari on macOS. Also headless Chromium on Linux (all sizes, local backend) |
+| **Not tested** | Safari on iPad; a direct cross-origin connection to OHB |
 | **Not available** | Anything that needs raw TCP or UDP: DX cluster, APRS-IS, HamAlert, rigctld, flrig, rotctld, gpsd, WSJT-X UDP. Also the RESTful API and Live Web servers (a page can't listen on ports), I2C/GPIO sensors, and the menu items a browser can't honor: upgrade, Reboot/Shutdown computer, and Restart/Exit/Factory reset HamClock (reload the page to restart; clear site data to reset) |
+
+**Browsers:** Chrome and Firefox are recommended.
+
+- **Safari** may report that a pop-up was blocked when HamClock opens a link. Clicking the address
+  bar again opens the page.
+- **The in-page overlay** for links that allow framing works only in Chrome and Edge. Other
+  browsers open those links in a new tab.
 
 ## Try it
 
