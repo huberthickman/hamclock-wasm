@@ -15,7 +15,7 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 
 ## What this is
 
-- The real client, not a rewrite. These patches apply to `openhamclock/hamclock` at
+- These patches apply to `openhamclock/hamclock` at
   [`b9db5fb`](https://github.com/openhamclock/hamclock/commit/b9db5fbe519faf84ee1350019eadb8747f1cd1e1)
   (v4.34b99) and build its existing `_WEB_ONLY` variant with Emscripten.
 - The change is small: **673 lines added and 2 changed across 13 files**, in seven patches. All code
