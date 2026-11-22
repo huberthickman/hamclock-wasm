@@ -5,10 +5,12 @@ WebAssembly so it runs entirely inside a web page, getting its data from the
 [Open HamClock Backend](https://github.com/komacke/open-hamclock-backend) (OHB). There's
 nothing to install and no server process per user: the page itself is the clock.
 
-![HamClock running in Chrome on macOS against ohb.hamclock.app](docs/screenshots/live-ohb.png)
+![HamClock running in Safari on macOS against ohb.hamclock.app, with the DX Cluster, HamAlert and Nearby APRS panes](docs/screenshots/live-ohb.png)
 
-*HamClock 4.34b99 running in Chrome on macOS with live data from ohb.hamclock.app: PSK Reporter
-spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot history.*
+*HamClock 4.34b99 running in Safari on macOS with live data from ohb.hamclock.app. The DX
+Cluster (dxspider.co.uk), HamAlert and Nearby APRS (rotate.aprs2.net) panes are connected
+through `devserver.py`'s TCP relay, with the cluster's spots plotted on the map, alongside
+the RS-44 satellite pass and NCDXF beacons.*
 
 > **Status: experimental proof of concept.** I'm sharing this so the HamClock and OHB developers
 > can look at it and say whether it's worth pursuing. See [Questions](#questions-for-hamclock-and-ohb-developers).
