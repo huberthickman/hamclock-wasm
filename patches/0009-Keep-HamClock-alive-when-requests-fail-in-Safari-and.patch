@@ -1,0 +1,89 @@
+From cd5d1ff934770e3fc0a6c8cd855f5290fd7a0d64 Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sat, 21 Nov 2026 23:08:18 -0600
+Subject: [PATCH 9/9] Keep HamClock alive when requests fail in Safari and
+ Firefox
+
+Emscripten counts each fetch on a per-thread keepalive counter and gives
+the count back from its error handler. When a synchronous request fails
+at the network level, as every request does while the page's server is
+stopped, Safari and Firefox both fire the request's error event and
+throw from send(), and Emscripten 3.1.51 gives the count back for each.
+The counter drops by two, and once it would go below zero a runtime
+assertion aborts HamClock: two failed requests while devserver.py was
+stopped were enough. Chromium only throws, so it was never affected.
+
+Route every synchronous fetch through syncFetch(), which adds one to the
+counter first and gives it back unless the request failed that way. A
+double give-back then balances; a single one leaves the counter one
+higher, which only keeps the thread alive, as it is anyway.
+
+All changes are inside #if __EMSCRIPTEN__.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/ArduinoLib/WiFiClient.cpp | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/ESPHamClock/ArduinoLib/WiFiClient.cpp b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+index 50c80a2..3785ece 100644
+--- a/ESPHamClock/ArduinoLib/WiFiClient.cpp
++++ b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+@@ -13,6 +13,7 @@
+ #include <strings.h>
+ #include <pthread.h>
+ #include <emscripten/fetch.h>
++#include <emscripten/eventloop.h>
+ 
+ /* browser build: HTTP over Emscripten's Fetch API.
+  *
+@@ -39,6 +40,28 @@
+ 
+ static int wasm_next_fd = 100000;         // fake fds for virtual connections, never passed to libc
+ 
++/* emscripten_fetch() in synchronous mode, for every request this file makes.
++ *
++ * Emscripten counts each fetch on a "keep this thread alive" counter, then gives it back from its
++ * error handler. When a synchronous request fails at the network level (the page's server is
++ * stopped, say), Safari and Firefox both fire the request's error event and throw from send(), and
++ * Emscripten (3.1.51) gives the count back for each, so the counter drops by two. Once it would go
++ * below zero, an assertion in the runtime aborts all of HamClock: two failed requests while
++ * devserver.py is stopped were enough. Chromium only throws, so it never happened there.
++ *
++ * Add one before each request and give it back unless the request failed that way (status 0).
++ * With a double give-back the books balance; with a single one, the counter is left one higher,
++ * which only means "keep this thread alive", as it is anyway.
++ */
++static emscripten_fetch_t *syncFetch (emscripten_fetch_attr_t *attr, const char *url)
++{
++    emscripten_runtime_keepalive_push();
++    emscripten_fetch_t *f = emscripten_fetch (attr, url);
++    if (f && f->status != 0)
++        emscripten_runtime_keepalive_pop();
++    return (f);
++}
++
+ void WiFiClient::wasmReset()
+ {
+     if (m_req) free (m_req);
+@@ -180,7 +203,7 @@ bool WiFiClient::wasmPerform()
+     strcpy (attr.requestMethod, "GET");
+     attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS | EMSCRIPTEN_FETCH_REPLACE;
+     attr.requestHeaders = headers.data();
+-    emscripten_fetch_t *f = emscripten_fetch (&attr, url.c_str());
++    emscripten_fetch_t *f = syncFetch (&attr, url.c_str());
+     if (!f) {
+         printf ("WiFiCl: GET %s: emscripten_fetch() refused\n", url.c_str());
+         return (false);
+@@ -275,7 +298,7 @@ static int relayRequest (const char *method, const char *op, const std::string &
+         attr.requestData = (const char *) body;
+         attr.requestDataSize = body_len;
+     }
+-    emscripten_fetch_t *f = emscripten_fetch (&attr, url.c_str());
++    emscripten_fetch_t *f = syncFetch (&attr, url.c_str());
+     if (!f)
+         return (0);
+     int status = f->status;
+-- 
+2.43.0
+

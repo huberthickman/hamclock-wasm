@@ -20,7 +20,7 @@ the RS-44 satellite pass and NCDXF beacons.*
 - The real client, not a rewrite. These patches apply to `openhamclock/hamclock` at
   [`b9db5fb`](https://github.com/openhamclock/hamclock/commit/b9db5fbe519faf84ee1350019eadb8747f1cd1e1)
   (v4.34b99) and build its existing `_WEB_ONLY` variant with Emscripten.
-- The change is small: **940 lines added and 2 changed across 13 files**, in eight patches. All code
+- The change is small: **963 lines added and 2 changed across 13 files**, in nine patches. All code
   changes are inside `#if defined(__EMSCRIPTEN__)`, plus a new `hamclock-wasm` Makefile target.
   The native `hamclock-web-800x480` build has been checked with g++ after patching.
 - The backend protocol is unchanged. The client still sends its usual
@@ -66,9 +66,11 @@ STRIP=1 PACKAGE=1 scripts/build_all.sh    # or name sizes: scripts/build_all.sh 
 ```
 
 This runs `build.sh` once per size. Each size is a full rebuild, so allow a few minutes each. With
-`PACKAGE=1` it also zips each size as `dist/hamclock-wasm-<version>-<size>.zip`, named from the
-repo's tag (override with `VERSION=`). Anyone who downloads a zip still needs to run
-`python3 devserver.py` from inside it: opening `index.html` directly won't work.
+`PACKAGE=1` it also zips each size as `dist/hamclock-wasm-<version>-<size>.zip`, and everything
+built, with the [launcher](#the-launcher), as `dist/hamclock-wasm-<version>-all-sizes.zip`. Zips
+are named from the repo's tag (override with `VERSION=`). Anyone who downloads a zip still needs
+to run the launcher or `python3 devserver.py` from inside it: opening `index.html` directly
+won't work.
 
 `build.sh` clones upstream at the pinned commit, applies `patches/`, builds and copies the page
 into `dist/<size>/`. `devserver.py` serves it with the headers the browser needs, forwards
@@ -113,6 +115,45 @@ You can change the defaults in the URL:
 - `?events=` sets the stream the page watches to tell that its server has stopped: `/events` (the
   default) or empty to not watch. A server without one is simply not watched.
 - `?args=` passes extra HamClock command-line arguments.
+
+## The launcher
+
+`launcher.py` is a small window for starting HamClock without a terminal, laid out like the
+[HamClock Launcher](https://machamclocklauncher.org) for the Mac. It's in the all-sizes release
+zip and in `dist/` after a build, and needs only Python 3 with tkinter, which the
+[python.org](https://www.python.org/downloads/) installers for macOS and Windows include.
+
+```sh
+python3 launcher.py                    # from the unzipped release, or: python3 dist/launcher.py
+```
+
+On a Mac you can double-click `HamClock Launcher.command` instead. Because it was downloaded,
+macOS may refuse it the first time: allow it under System Settings → Privacy & Security, or use
+the command above.
+
+- **Choose a size and a backend:** Open HamClock Backend, hamclock.com, or your own host:port.
+  Sizes not in the folder are greyed out.
+- **Start HamClock** runs that size's `devserver.py` and opens HamClock in your default browser.
+  If a HamClock tab is still open from before, it reconnects instead of a new one opening.
+- **Stop HamClock** stops `devserver.py`. The HamClock tab then says "HamClock's local
+  communication process has stopped"; close it, or press Start HamClock again.
+- **Changing size:** Stop, choose another size, Start. A tab still open from before reloads
+  itself at the new size. Your settings carry over, since the address stays
+  `http://localhost:8000/`.
+- **HamClock Output** shows `devserver.py`'s log and HamClock's own output (lines starting `HC:`),
+  as the native HamClock would print it. Problems such as a refused connection are in red. "Show
+  file requests" adds the routine requests for the page's files; "Save Output…" writes everything
+  to a file, handy for reporting a problem.
+- **The status line** says whether a browser tab is connected.
+- **Settings** (size, backend, the output options) are remembered in
+  `~/Library/Application Support/HamClock WebAssembly Launcher/` on a Mac,
+  `%APPDATA%\HamClock WebAssembly Launcher\` on Windows and `~/.config/hamclock-wasm-launcher/`
+  on Linux. The port is fixed at 8000; a `"port"` entry in `settings.json` changes it, but
+  HamClock's settings are kept per port, so a new port starts afresh.
+
+If tkinter is missing, the launcher says how to get it. Python from Homebrew needs
+`brew install python-tk`, and Linux distributions package it separately (`python3-tk`). Apple's
+own `/usr/bin/python3` has an outdated Tk, so python.org's Python is the better choice on a Mac.
 
 ## Where settings live
 
@@ -255,13 +296,18 @@ hamclock-wasm/
 │   ├── 0005-Hand-openURL-requests-to-the-browser-page.patch
 │   ├── 0006-Restart-by-reloading-the-browser-page.patch
 │   ├── 0007-Fetch-third-party-https-APIs-through-the-page-s-prox.patch
-│   └── 0008-Relay-raw-TCP-through-the-page-s-server-HamAlert-DX-.patch
+│   ├── 0008-Relay-raw-TCP-through-the-page-s-server-HamAlert-DX-.patch
+│   └── 0009-Keep-HamClock-alive-when-requests-fail-in-Safari-and.patch
 ├── web/
 │   ├── index.html              host page: canvas, input, links, storage, configuration
-│   └── devserver.py            local server: COOP/COEP headers, /ohb and /xhttp proxies, /tcp relay (stdlib only)
+│   ├── devserver.py            local server: COOP/COEP headers, /ohb and /xhttp proxies, /tcp relay,
+│   │                           /events and /log for the page (stdlib only)
+│   ├── launcher.py             window to choose a size and backend and run devserver.py (tkinter)
+│   └── HamClock Launcher.command   macOS: double-click to run launcher.py
 ├── scripts/
 │   ├── build.sh                clone upstream, apply patches, build, collect dist/<size>/
-│   └── build_all.sh            build.sh for every size, optionally zipped for a release
+│   └── build_all.sh            build.sh for every size, optionally zipped for a release,
+│                               with an all-sizes zip that includes the launcher
 └── docs/
     ├── DESIGN.md               how it works, build flags, limitations
     ├── OHB-BACKEND.md          what a browser client needs from an OHB server
@@ -280,6 +326,7 @@ hamclock-wasm/
 | 0006 | `ESPHamClock.cpp`, `HamClock.h`, `wasm_glue.cpp` | `doReboot()` asks the page to save settings and reload, carrying `-K`/`-0` to the next start |
 | 0007 | `ArduinoLib/WiFiClient.{h,cpp}` | curl commands keep their `-A` and `-H` headers (the hams.at API key); third-party https goes through the page's `/xhttp/` proxy |
 | 0008 | `ArduinoLib/WiFiClient.{h,cpp}` | Other TCP ports go through the page's `/tcp/` relay: connect, send, and one long-polling thread for everything that arrives; a dropped relay ends the connections as EOF would |
+| 0009 | `ArduinoLib/WiFiClient.cpp` | Keeps HamClock from aborting in Safari and Firefox when requests fail, as they all do while `devserver.py` is stopped (an Emscripten keepalive-counter quirk; see DESIGN.md) |
 
 To read them as commits rather than patch files:
 `git am patches/*.patch` on a branch at `b9db5fb`.

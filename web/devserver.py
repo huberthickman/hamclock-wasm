@@ -7,7 +7,7 @@
                        [--tcp-allow HOST:PORT ...] [--no-tcp]
 
 Serves this directory with the cross-origin isolation headers that SharedArrayBuffer (and so
-HamClock's threads) require, plus four same-origin routes for the page:
+HamClock's threads) require, plus five same-origin routes for the page:
 
 /ohb/...    HamClock's backend. --backend-url proxies to a real backend (default
             http://ohb.hamclock.app), turning X-HamClock-UA back into User-Agent so the backend's
@@ -34,12 +34,17 @@ HamClock's threads) require, plus four same-origin routes for the page:
 /events     a Server-Sent Events stream each open page keeps connected, so the page can tell
             when this server has stopped and say so. On Ctrl-C or SIGTERM the server sends each
             page a "stopped" event before it exits; if it vanishes without one, the page notices
-            the connection drop instead. The log notes pages connecting and disconnecting.
+            the connection drop instead. The log notes pages connecting and disconnecting. On
+            connecting, a page is told which hamclock.wasm this server has (so a tab left open
+            across a size change reloads itself) and whether to send HamClock's output to /log.
+
+/log        with --show-hamclock-log, the page sends what HamClock prints and it appears here
+            prefixed "HC: ", as the native HamClock's output would. The launcher uses this.
 
 Listens on 127.0.0.1 only unless --bind says otherwise. Browsers only run the page from
 localhost or over HTTPS anyway, so other machines can't use a plain-HTTP server like this one.
 """
-import argparse, http.server, ipaddress, os, re, select, signal, socket, sys, threading, time, \
+import argparse, http.server, ipaddress, json, os, re, select, signal, socket, sys, threading, time, \
     urllib.parse, urllib.request, urllib.error
 
 ap = argparse.ArgumentParser(description='HamClock WebAssembly development server')
@@ -59,6 +64,10 @@ ap.add_argument('--tcp-allow', action='append', default=[], metavar='HOST:PORT',
 ap.add_argument('--no-tcp', action='store_true', help='turn the /tcp/ relay off')
 ap.add_argument('--tcp-upstream', action='append', default=[], metavar='HOST:PORT=ADDR:PORT',
                 help='connect /tcp/ requests for HOST:PORT to ADDR:PORT instead (testing)')
+ap.add_argument('--show-hamclock-log', action='store_true',
+                help="print HamClock's own output, sent by the page, prefixed HC:")
+ap.add_argument('--exit-on-stdin-close', action='store_true',
+                help='stop cleanly when standard input closes (for a launcher running this)')
 args = ap.parse_args()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -181,6 +190,15 @@ if not args.no_tcp:
     threading.Thread(target=tcp_reaper, daemon=True).start()
 
 
+def build_id():
+    """identifies the hamclock.wasm being served, so a tab left open across a change reloads"""
+    try:
+        st = os.stat(os.path.join(HERE, 'hamclock.wasm'))
+        return f'{st.st_size}-{st.st_mtime_ns}'
+    except OSError:
+        return ''
+
+
 # pages connected to /events, and set once this server is stopping
 events_lock = threading.Lock()
 events_open = 0
@@ -197,8 +215,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def log_request(self, code='-', size='-'):
-        # the TCP and PAGE lines say more, and polls would fill the log every 20 seconds
-        if not ((self.path.startswith('/tcp/') or self.path == '/events') and str(code) == '200'):
+        # the TCP, PAGE and HC lines say more, and polls would fill the log every 20 seconds
+        quiet = self.path.startswith('/tcp/') or self.path in ('/events', '/log')
+        if not (quiet and str(code).startswith('2')):
             super().log_request(code, size)
 
     def guess_type(self, path):
@@ -222,6 +241,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith('/tcp/'):
             return self.tcp('POST')
+        if self.path == '/log':
+            return self.page_log()
         self.send_error(405)
 
     def reply(self, status, hdrs, data):
@@ -295,6 +316,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                          f'{", with Authorization" if "Authorization" in headers else ""}\n')
         self.reply(status, hdrs, data)
 
+    def page_log(self):
+        """print lines of HamClock's output sent by the page"""
+        n = min(int(self.headers.get('Content-Length') or 0), 1 << 20)
+        body = self.rfile.read(n)
+        if self.not_our_page():
+            return self.text(403, 'not from the HamClock page')
+        if args.show_hamclock_log:
+            for line in body.decode('utf-8', 'replace').splitlines():
+                sys.stderr.write(f'HC: {line}\n')
+        self.send_response(204)
+        self.end_headers()
+
     def events(self):
         """keep a page's status stream open until it disconnects or this server stops"""
         global events_open
@@ -306,7 +339,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             n = events_open
         sys.stderr.write(f'PAGE connected ({n} open)\n')
         try:
+            config = json.dumps({'log': args.show_hamclock_log, 'build': build_id()})
             self.wfile.write(b'retry: 2000\n: hello\n\n')      # reconnect every 2 s when lost
+            self.wfile.write(f'event: config\ndata: {config}\n\n'.encode())
             last = time.time()
             while not stopping.wait(1):
                 # pages never send on this connection, so anything readable is the tab hanging up
@@ -429,10 +464,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 def stop_now(*_):
     raise KeyboardInterrupt
 
-server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
-for sig in ('SIGTERM', 'SIGHUP'):           # a launcher's Stop, or the terminal closing
+try:
+    server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
+except OSError as e:
+    print(f'Can not listen on port {args.port}: {e.strerror or e}.\n'
+          f'Is another HamClock still running? Stop it, or use --port.', flush=True)
+    sys.exit(1)
+for sig in ('SIGTERM', 'SIGHUP'):           # a signal from a launcher, or the terminal closing
     if hasattr(signal, sig):
         signal.signal(getattr(signal, sig), stop_now)
+if args.exit_on_stdin_close:
+    # a launcher stops us by closing our input: works the same on every system, and if the launcher
+    # dies, so do we, instead of keeping the port busy
+    def watch_stdin():
+        while sys.stdin.buffer.read(4096):
+            pass
+        server.shutdown()
+    threading.Thread(target=watch_stdin, daemon=True).start()
 print(f'HamClock: http://localhost:{args.port}/   (listening on {args.bind}:{args.port})', flush=True)
 try:
     server.serve_forever()
