@@ -137,6 +137,16 @@ On a Mac you can double-click `HamClock Launcher.command` instead. Because it wa
 macOS may refuse it the first time: allow it under System Settings → Privacy & Security, or use
 the command above.
 
+On Windows, double-click `HamClock Launcher.bat`. It finds Python (the `py` command the python.org
+installer adds, or `python`), checks that it has tkinter, and starts the launcher without a
+console window. If Python is missing or unsuitable, it says so and how to fix it. Windows may
+warn about running a downloaded file the first time: choose More info → Run anyway.
+
+![The launcher on Windows 11, running the 1600x960 build against ohb.hamclock.app](docs/screenshots/launcher-windows.png)
+
+*The launcher on Windows 11, running the 1600x960 build against ohb.hamclock.app with one
+browser tab connected, showing DX cluster spots and the APRS-IS server's greeting as they arrive.*
+
 - **Choose a size and a backend:** Open HamClock Backend, hamclock.com, or your own host:port.
   Sizes not in the folder are greyed out.
 - **Start HamClock** runs that size's `devserver.py` and opens HamClock in your default browser.
@@ -293,6 +303,7 @@ More detail is in [docs/DESIGN.md](docs/DESIGN.md).
 ```
 hamclock-wasm/
 ├── README.md
+├── .gitattributes              keeps the Windows .bat file's CRLF line endings
 ├── LICENSE                     MIT, same as upstream
 ├── patches/                    git format-patch series against openhamclock/hamclock@b9db5fb
 │   ├── 0001-WiFiClient-perform-HTTP-with-the-Emscripten-Fetch-AP.patch
@@ -309,7 +320,8 @@ hamclock-wasm/
 │   ├── devserver.py            local server: COOP/COEP headers, /ohb and /xhttp proxies, /tcp relay,
 │   │                           /events and /log for the page (stdlib only)
 │   ├── launcher.py             window to choose a size and backend and run devserver.py (tkinter)
-│   └── HamClock Launcher.command   macOS: double-click to run launcher.py
+│   ├── HamClock Launcher.command   macOS: double-click to run launcher.py
+│   └── HamClock Launcher.bat       Windows: double-click to run launcher.py
 ├── scripts/
 │   ├── build.sh                clone upstream, apply patches, build, collect dist/<size>/
 │   └── build_all.sh            build.sh for every size, optionally zipped for a release,
