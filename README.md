@@ -129,6 +129,10 @@ python3 launcher.py        # macOS and Linux
 py launcher.py             # Windows (the python.org installer adds the "py" command)
 ```
 
+On Windows, if `py` is "not recognized", Python isn't installed: get it from
+[python.org](https://www.python.org/downloads/) and try again. Use `py` rather than `python3`,
+which on Windows usually opens the Microsoft Store even when Python is installed.
+
 ![The launcher on macOS, running the 3200x1920 build against ohb.hamclock.app](docs/screenshots/launcher-macos.png)
 
 *The launcher on macOS, running the 3200x1920 build against ohb.hamclock.app, with one browser
@@ -152,7 +156,9 @@ browser tab connected, showing DX cluster spots and the APRS-IS server's greetin
 - **HamClock Output** shows `devserver.py`'s log and HamClock's own output (lines starting `HC:`),
   as the native HamClock would print it. Problems such as a refused connection are in red. "Show
   file requests" adds the routine requests for the page's files; "Save Output…" writes everything
-  to a file, handy for reporting a problem.
+  to a file, handy for reporting a problem. To copy from it, select text (or use Select All) and
+  choose Copy, from the **Edit** menu or with ⌘A / Ctrl+A and ⌘C / Ctrl+C. Edit also has Cut and
+  Paste for the Host:Port box.
 - **The status line** says whether a browser tab is connected.
 - **Settings** (size, backend, the output options) are remembered in
   `~/Library/Application Support/HamClock WebAssembly Launcher/` on a Mac,
