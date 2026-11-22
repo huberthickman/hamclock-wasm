@@ -51,7 +51,8 @@ if [ "${PACKAGE:-0}" = 1 ]; then
     all="hamclock-wasm-$VERSION"
     rm -rf "$ROOT/dist/$all" "$ROOT/dist/$all-all-sizes.zip"
     mkdir "$ROOT/dist/$all"
-    cp -p "$ROOT/web/launcher.py" "$ROOT/web/HamClock Launcher.command" "$ROOT/dist/$all/"
+    cp -p "$ROOT/web/launcher.py" "$ROOT/web/HamClock Launcher.command" "$ROOT/web/HamClock Launcher.bat" \
+        "$ROOT/dist/$all/"
     echo "$VERSION" > "$ROOT/dist/$all/VERSION"
     for size in "${SIZES[@]}"; do
         cp -Rp "$ROOT/dist/$size" "$ROOT/dist/$all/"
