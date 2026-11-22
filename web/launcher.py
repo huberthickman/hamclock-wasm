@@ -28,7 +28,7 @@ try:
 except ImportError:
     sys.exit(MISSING_TK)
 
-APP = 'HamClock Launcher (WebAssembly)'
+APP = 'HamClock Launcher (Universal/WebAssembly)'
 REPO = 'https://github.com/huberthickman/hamclock-wasm'
 SIZES = ['800x480', '1600x960', '2400x1440', '3200x1920']
 BACKENDS = [                                # (setting, label, host:port)
