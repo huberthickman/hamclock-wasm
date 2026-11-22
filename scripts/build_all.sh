@@ -7,8 +7,9 @@
 #   STRIP=1        strip debug info with wasm-opt (about 9.5 MB -> 1.7-1.9 MB per size)
 #   JOBS, UPSTREAM_URL, UPSTREAM_REF   as for build.sh
 # and for this script:
-#   PACKAGE=1      also zip each size as dist/hamclock-wasm-<VERSION>-<size>.zip, for releases.
-#                  (Not ZIP=1: zip itself reads $ZIP as default options.)
+#   PACKAGE=1      also zip each size as dist/hamclock-wasm-<VERSION>-<size>.zip, and everything
+#                  built, with the launcher, as dist/hamclock-wasm-<VERSION>-all-sizes.zip, for
+#                  releases. (Not ZIP=1: zip itself reads $ZIP as default options.)
 #   VERSION        version in the zip names (default: this repo's tag, from git describe)
 #
 # Each size is a full rebuild: the Makefile cleans whenever the size changes, because object files
@@ -45,6 +46,20 @@ for size in "${SIZES[@]}"; do
     fi
 done
 
+if [ "${PACKAGE:-0}" = 1 ]; then
+    # one folder with the launcher and every size built
+    all="hamclock-wasm-$VERSION"
+    rm -rf "$ROOT/dist/$all" "$ROOT/dist/$all-all-sizes.zip"
+    mkdir "$ROOT/dist/$all"
+    cp -p "$ROOT/web/launcher.py" "$ROOT/web/HamClock Launcher.command" "$ROOT/dist/$all/"
+    echo "$VERSION" > "$ROOT/dist/$all/VERSION"
+    for size in "${SIZES[@]}"; do
+        cp -Rp "$ROOT/dist/$size" "$ROOT/dist/$all/"
+    done
+    (cd "$ROOT/dist" && env -u ZIP -u ZIPOPT zip -qr "$all-all-sizes.zip" "$all")
+    rm -rf "$ROOT/dist/$all"
+fi
+
 echo
 echo "built ${#SIZES[@]} size(s) in $(( (SECONDS - start) / 60 )) min $(( (SECONDS - start) % 60 )) s:"
 for size in "${SIZES[@]}"; do
@@ -55,4 +70,5 @@ if [ "${PACKAGE:-0}" = 1 ]; then
     for size in "${SIZES[@]}"; do
         echo "  dist/hamclock-wasm-$VERSION-$size.zip"
     done
+    echo "  dist/hamclock-wasm-$VERSION-all-sizes.zip   (with the launcher)"
 fi

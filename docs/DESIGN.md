@@ -96,6 +96,24 @@ of which the browser reports as status 0. HamClock then shows the same "download
 "data invalid" messages it shows natively. HTTP errors such as 404 aren't failures at this
 level. They reach HamClock with their status, as they would natively.
 
+**Failed requests in Safari and Firefox** (patch 0009). Emscripten counts each fetch on a
+per-thread keepalive counter, and gives the count back from its error handler. When a synchronous
+request fails at the network level, Safari and Firefox both fire the request's `error` event and
+throw from `send()`. Emscripten 3.1.51 handles both, so the count is given back twice. Once the
+counter would go below zero, a runtime assertion aborts all of HamClock
+(`Aborted(Assertion failed)` from `runtimeKeepalivePop`). Every request fails while
+`devserver.py` is stopped, so stopping it for longer than two HamClock fetches killed the tab in
+those browsers. Chromium only throws, so it was never affected.
+
+All synchronous fetches therefore go through `syncFetch()`, which calls
+`emscripten_runtime_keepalive_push()` first, and `..._pop()` afterwards unless the request
+failed with status 0. A double give-back then balances. A single one, in Chromium, leaves the
+counter one higher, which only means "keep this thread alive", as it is anyway. Tested in
+Chromium with a test copy of `hamclock.js` whose `XMLHttpRequest.send()` also fires `error`
+before throwing, as Safari does. Without the patch, HamClock aborted while its server was
+stopped for 70 s; with it, HamClock kept running and carried on when the server returned.
+Plain Chromium was unchanged.
+
 **Timeouts.** The native client gives up connecting after 8 seconds. Browsers don't allow a
 timeout on a synchronous request, and the Fetch API's `timeoutMSecs` only applies to asynchronous
 ones. `emscripten_fetch_wait()` with a timeout looks like an alternative, but in Emscripten 3.1.51
@@ -339,6 +357,45 @@ Then on macOS against the real servers: the DX Cluster pane connected to `dxspid
 and listed live spots, HamAlert delivered a spot from a telnet trigger, and Nearby APRS listed
 stations from `rotate.aprs2.net:14580`.
 
+## The launcher
+
+`web/launcher.py` is a tkinter window, standard library only, that runs `devserver.py` for one of
+the size folders beside it and shows its output. It's a front end: everything it does can be done
+with `devserver.py` on the command line.
+
+- **Running `devserver.py`.** It starts `sys.executable -u <size>/devserver.py --port 8000
+  --backend-url http://HOST:PORT --show-hamclock-log --exit-on-stdin-close` with pipes for its
+  input and output. `PYTHONIOENCODING=utf-8` keeps non-ASCII output from failing on Windows, and
+  on Windows it runs without a console window. A thread reads the output into a queue, which the
+  Tk loop drains every 100 ms, since Tk may only be used from its own thread.
+- **Stopping.** The launcher closes `devserver.py`'s input. `--exit-on-stdin-close` turns that into
+  the same clean shutdown as Ctrl-C, which tells open tabs first. This works the same on every
+  system, unlike signals, which on Windows can only kill. If `devserver.py` is still running 3 s
+  later it is terminated, and killed after 5 s. If the launcher itself dies, its end of the pipe
+  closes and `devserver.py` exits, rather than holding port 8000.
+- **Opening the browser.** After `devserver.py` prints that it is listening, the launcher waits
+  2.5 s. A tab left open from before reconnects within about 2 s (the `/events` retry interval) and
+  shows up as `PAGE connected`; only if none does is `webbrowser.open()` called. The URL carries
+  `?b=HOST:PORT`, so HamClock's `-b` matches the backend `devserver.py` proxies to.
+- **Status.** `PAGE connected (n open)` and `PAGE disconnected (n open)` lines give the tab count
+  shown in the status line.
+- **Output.** All lines are kept (up to 20,000) so "Show file requests" can redisplay them and
+  "Save Output…" can write them. Lines are coloured red when they contain refused, failed, error or
+  a traceback (`HC:` lines excepted, since HamClock's own messages use those words routinely).
+- **Settings** are a small JSON file in the user's configuration folder.
+
+Tested on Linux with Python 3.12 and Tk 9.0, under a virtual display, with headless Chromium as
+the browser, through a whole session:
+- start with a custom backend, opening one tab;
+- stop, with the tab showing its notice;
+- switch to 1600x960, where the open tab reconnected, reloaded at the new size and no second tab
+  was opened;
+- quit while running, which stopped `devserver.py` first.
+
+Also tested: port 8000 already in use (an error message and status); the launcher being killed
+(`devserver.py` exited and freed the port); and a Python without tkinter (the install message).
+Python from python.org on macOS and Windows has Tk 8.6, and the launcher uses nothing beyond it.
+
 ## Platform stubs (patch 0002)
 
 | Native behavior | Browser build |
@@ -428,7 +485,19 @@ request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makef
   checks every second whether each tab has hung up, so the count stays right; a launcher can use
   it to know whether a tab is still open.
 - The defaults at the top of the file (`DEFAULT_BACKEND_HOST`, `DEFAULT_BACKEND_BASE`,
-  `DEFAULT_XHTTP_BASE`, `DEFAULT_TCP_BASE`) are the only things a deployer should need to edit.
+  `DEFAULT_XHTTP_BASE`, `DEFAULT_TCP_BASE`, `DEFAULT_EVENTS`) are the only things a deployer
+  should need to edit.
+- **HamClock's output.** Everything HamClock prints, from any thread, reaches the page's
+  `Module.print`: pthreads' `fd_write` is proxied to the main thread. The page still copies each
+  line to the console, and also keeps the last 500. When `/events`' `config` message says
+  `"log": true` (`devserver.py --show-hamclock-log`), it posts what it has to `/log` about once a
+  second, and `devserver.py` prints each line as `HC: …`. While the server is away the lines wait,
+  up to 500, and are sent once it's back. `/log` has the same page-only checks as `/xhttp`. With
+  logging off, the page keeps nothing.
+- **A tab left open across a change.** `config` also carries a build id, the served
+  `hamclock.wasm`'s size and modification time. If it differs from the one the tab started with
+  (the launcher was switched to another size, or there's a new build), the tab saves its settings
+  and reloads.
 
 ## Build flags
 

@@ -118,8 +118,8 @@ let image = null, appW = 800, appH = 480;
 function status(s) { statusEl.textContent = s; }
 
 var Module = {
-  print:    (t) => console.log(t),
-  printErr: (t) => console.warn(t),
+  print:    (t) => { console.log(t); hcLog(t); },
+  printErr: (t) => { console.warn(t); hcLog(t); },
   preRun: [() => {
     Module.ENV.HC_BACKEND_BASE = BACKEND_BASE;
     if (XHTTP_BASE) Module.ENV.HC_XHTTP_BASE = XHTTP_BASE;
@@ -352,14 +352,42 @@ function showNotice(kind) {
 }
 function hideNotice() { $('notice').style.display = 'none'; }
 
+// ---- HamClock's output to the server --------------------------------------------------------
+// Everything HamClock prints, from any of its threads, comes through Module.print. When the server
+// asks for it (devserver.py --show-hamclock-log, as the launcher runs it), send it there about once
+// a second so it appears alongside the server's own log. While the server is away, keep the most
+// recent lines and send them when it's back.
+const LOG_KEEP = 500;
+let logOn = null;                 // null until the server says; false: don't keep anything
+let logLines = [], logSending = false;
+function hcLog(t) {
+  if (logOn === false) return;
+  logLines.push(t);
+  if (logLines.length > LOG_KEEP) logLines.splice(0, logLines.length - LOG_KEEP);
+}
+setInterval(() => {
+  if (!logOn || logSending || !logLines.length) return;
+  const batch = logLines;
+  logLines = [];
+  logSending = true;
+  fetch('/log', { method: 'POST', body: batch.join('\n'),
+                  headers: { 'X-HamClock-Proxy': '1', 'Content-Type': 'text/plain' } })
+    .then((r) => { if (!r.ok) throw new Error(r.status); })
+    .catch(() => { logLines = batch.concat(logLines).slice(-LOG_KEEP); })
+    .finally(() => { logSending = false; });
+}, 1000);
+
 // ---- watch this page's server ---------------------------------------------------------------
 // The server sends "stopped" before it exits on purpose; a dropped connection without it means
 // the server crashed or the computer slept, so say so only if it lasts 3 s. Either way HamClock
 // keeps running, and the notice goes away when the server is back. A server without /events
 // (the first connection never opens) just isn't watched.
+// On each connection the server also says which hamclock.wasm it has and whether it wants
+// HamClock's output. A different build than this tab is running (the launcher was switched to
+// another size, say) means this tab is stale, so save and reload.
 function watchServer() {
-  if (!EVENTS || !window.EventSource) return;
-  let everOpen = false, stopped = false, lostTimer = 0, es;
+  if (!EVENTS || !window.EventSource) { logOn = false; logLines = []; return; }
+  let everOpen = false, stopped = false, lostTimer = 0, build = null, es;
   const connect = () => {
     es = new EventSource(EVENTS);
     es.onopen = () => {
@@ -369,6 +397,18 @@ function watchServer() {
       lostTimer = 0;
       hideNotice();
     };
+    es.addEventListener('config', (e) => {
+      let c = {};
+      try { c = JSON.parse(e.data); } catch (err) {}
+      logOn = !!c.log;
+      if (!logOn) logLines = [];
+      if (c.build && build && c.build !== build) {
+        console.log('the server has a different HamClock build: reloading');
+        if (running) Module.FS.syncfs(false, () => location.reload());
+        else location.reload();
+      }
+      build = c.build || build;
+    });
     es.addEventListener('stopped', () => {
       stopped = true;
       showNotice('stopped');
@@ -377,6 +417,8 @@ function watchServer() {
     es.onerror = () => {
       if (!everOpen) {
         console.log(`${EVENTS}: not available, so not watching the server`);
+        logOn = false;
+        logLines = [];
         es.close();
         return;
       }
