@@ -127,10 +127,27 @@ A copy of the page hosted on OHB would need one of:
   directly (`?xhttp=` empty): no proxy, and no third party holding anyone's key. It may be worth
   asking both operators.
 
+## TCP connections
+
+The DX Cluster, HamAlert and Nearby APRS panes need plain TCP connections, which a page can't
+make. Locally, `devserver.py` relays them through `/tcp/` (see
+[DESIGN.md](DESIGN.md#tcp-relay-patch-0008)). A hosted copy would need the same relay on the
+server. That's more than a proxy for occasional requests:
+
+- each user with those panes keeps up to three connections open around the clock, from the
+  server's IP address;
+- users' DX cluster logins and HamAlert telnet passwords would pass through the server (they
+  travel unencrypted to those services anyway);
+- cluster nodes and APRS-IS servers that limit connections per IP would see all users as one.
+
+Without a relay, the page simply runs with those three panes unable to connect, as it did before
+patch 0008 (set `DEFAULT_TCP_BASE = ''`).
+
 ## Open questions for OHB
 
 - Does the public `ohb.hamclock.app` serve HTTPS with a publicly trusted certificate? (The
   reference NGINX config listens on 443.)
-- Would OHB be willing to host the client under its own domain (option A)?
+- Would OHB be willing to host the client under its own domain (option A)? If so, with or
+  without the TCP relay?
 - Are there endpoints besides `fetchIPGeoloc.pl`, the `wx.pl` limits and `version.pl` that depend
   on the client IP or the User-Agent format?

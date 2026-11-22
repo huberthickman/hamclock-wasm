@@ -29,6 +29,17 @@
   #embed-header button, #url-bar button { background: #333; color: #eee; border: 1px solid #888;
              border-radius: 3px; padding: 4px 10px; font: 13px sans-serif; cursor: pointer; }
   #embed-header button:hover, #url-bar button:hover { background: #444; }
+
+  /* why HamClock isn't running here: its server stopped or can't be reached, or it's already open
+     in another tab. Covers the page; HamClock keeps running underneath and carries on afterwards. */
+  #notice { display: none; position: fixed; inset: 0; z-index: 2000; align-items: center;
+            justify-content: center; background: rgba(0,0,0,.65); }
+  #notice-box { max-width: min(520px, 90vw); padding: 18px 22px; background: #222; color: #eee;
+                border: 1px solid #888; border-radius: 6px; box-shadow: 0 0 20px rgba(0,0,0,.8);
+                font: 15px/1.45 sans-serif; }
+  #notice-title { font-size: 19px; font-weight: bold; margin-bottom: 8px; }
+  #notice-text p { margin: 6px 0; }
+  #notice-text code { color: #fd8; }
 </style>
 </head>
 <body>
@@ -43,6 +54,9 @@
   <div id="embed-note">Taking a while to load? This site may not allow embedding; try "Open in new tab" above.</div>
   <!-- credentialless: lets a page without COEP headers load inside this COEP page (Chromium) -->
   <iframe id="embed-frame" credentialless referrerpolicy="no-referrer"></iframe>
+</div>
+<div id="notice" role="alert">
+  <div id="notice-box"><div id="notice-title"></div><div id="notice-text"></div></div>
 </div>
 <div id="url-bar" role="alert">
   <span id="url-bar-text"></span>
@@ -60,18 +74,29 @@
 //                         (hams.at, the Meshtastic map) are fetched through:
 //     '/xhttp'            this page's server, as devserver.py provides: /xhttp/hams.at/...
 //     ''                  straight from the browser (only works for APIs that send CORS headers)
+//   DEFAULT_TCP_BASE      the relay for plain TCP connections (HamAlert, DX clusters, APRS-IS):
+//     '/tcp'              this page's server, as devserver.py provides
+//     ''                  none: those panes report that they can't connect
+//   DEFAULT_EVENTS        a Server-Sent Events stream from this page's server, used only to tell
+//                         when the server has stopped:
+//     '/events'           as devserver.py provides; turns itself off if the server has none
+//     ''                  don't watch
 const DEFAULT_BACKEND_HOST = 'ohb.hamclock.app:80';
 const DEFAULT_BACKEND_BASE = '/ohb';
 const DEFAULT_XHTTP_BASE = '/xhttp';
+const DEFAULT_TCP_BASE = '/tcp';
+const DEFAULT_EVENTS = '/events';
 
 // All overridable in the URL: ?b=host:port  ?backend=/ohb|/|https://host  ?xhttp=/xhttp|(empty)
-//                              ?args=extra+hamclock+args
+//                              ?tcp=/tcp|(empty)  ?events=/events|(empty)  ?args=extra+hamclock+args
 const params = new URLSearchParams(location.search);
 const BACKEND_HOST = params.get('b') || DEFAULT_BACKEND_HOST;
 let BACKEND_BASE = params.get('backend') || DEFAULT_BACKEND_BASE;
 if (BACKEND_BASE === '/') BACKEND_BASE = location.origin;   // "/" + "/ham/..." would be protocol-relative
 BACKEND_BASE = BACKEND_BASE.replace(/\/+$/, '');
 const XHTTP_BASE = (params.has('xhttp') ? params.get('xhttp') : DEFAULT_XHTTP_BASE).replace(/\/+$/, '');
+const TCP_BASE = (params.has('tcp') ? params.get('tcp') : DEFAULT_TCP_BASE).replace(/\/+$/, '');
+const EVENTS = params.has('events') ? params.get('events') : DEFAULT_EVENTS;
 const APPDIR = '/home/web_user/.hamclock';
 
 // restarts: HamClock asks for one with -K (skip the startup countdown) and/or -0 (restore default
@@ -98,6 +123,7 @@ var Module = {
   preRun: [() => {
     Module.ENV.HC_BACKEND_BASE = BACKEND_BASE;
     if (XHTTP_BASE) Module.ENV.HC_XHTTP_BASE = XHTTP_BASE;
+    if (TCP_BASE) Module.ENV.HC_TCP_BASE = TCP_BASE;
   }],
   onRuntimeInitialized: () => {
     // persist ~/.hamclock (settings "EEPROM", cached maps) in IndexedDB
@@ -305,7 +331,89 @@ $('embed-close').onclick = hideEmbed;
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && $('embed-overlay').style.display === 'flex') hideEmbed();
 });
+
+// ---- notices covering the page --------------------------------------------------------------
+const NOTICES = {
+  stopped: ["HamClock's local communication process has stopped",
+            "<p>Start it again and HamClock carries on here, or close this tab.</p>" +
+            "<p>If you started it from a terminal: <code>python3 devserver.py</code></p>" +
+            "<p>Your settings are saved in this browser.</p>"],
+  lost:    ["Can't reach HamClock's local communication process",
+            "<p>Waiting for it to come back. If you stopped it, start it again, or close this tab.</p>" +
+            "<p>If you started it from a terminal: <code>python3 devserver.py</code></p>" +
+            "<p>Your settings are saved in this browser.</p>"],
+  busy:    ["HamClock is already open in another tab",
+            "<p>Use that tab, or close it and HamClock will start here.</p>"],
+};
+function showNotice(kind) {
+  $('notice-title').textContent = NOTICES[kind][0];
+  $('notice-text').innerHTML = NOTICES[kind][1];
+  $('notice').style.display = 'flex';
+}
+function hideNotice() { $('notice').style.display = 'none'; }
+
+// ---- watch this page's server ---------------------------------------------------------------
+// The server sends "stopped" before it exits on purpose; a dropped connection without it means
+// the server crashed or the computer slept, so say so only if it lasts 3 s. Either way HamClock
+// keeps running, and the notice goes away when the server is back. A server without /events
+// (the first connection never opens) just isn't watched.
+function watchServer() {
+  if (!EVENTS || !window.EventSource) return;
+  let everOpen = false, stopped = false, lostTimer = 0, es;
+  const connect = () => {
+    es = new EventSource(EVENTS);
+    es.onopen = () => {
+      everOpen = true;
+      stopped = false;
+      clearTimeout(lostTimer);
+      lostTimer = 0;
+      hideNotice();
+    };
+    es.addEventListener('stopped', () => {
+      stopped = true;
+      showNotice('stopped');
+      if (running) Module.FS.syncfs(false, () => {});      // save settings now, while we can
+    });
+    es.onerror = () => {
+      if (!everOpen) {
+        console.log(`${EVENTS}: not available, so not watching the server`);
+        es.close();
+        return;
+      }
+      if (!stopped && !lostTimer)
+        lostTimer = setTimeout(() => {
+          lostTimer = 0;
+          if (es.readyState !== EventSource.OPEN) showNotice('lost');
+        }, 3000);
+      if (es.readyState === EventSource.CLOSED)            // the browser gave up retrying
+        setTimeout(connect, 3000);
+    };
+  };
+  connect();
+}
+
+// ---- start, in one tab at a time ------------------------------------------------------------
+// Two HamClocks in one browser would share one settings file, each overwriting the other's. A
+// Web Lock, held until the tab closes or reloads, keeps that to one tab; another tab waits, and
+// starts by itself once the first one closes.
+function startHamClock() {
+  hideNotice();
+  const script = document.createElement('script');
+  script.src = 'hamclock.js';
+  document.body.appendChild(script);
+  watchServer();
+  return new Promise(() => {});                           // hold the lock for the page's life
+}
+if (navigator.locks) {
+  navigator.locks.request('hamclock', { ifAvailable: true }, (lock) => {
+    if (lock) return startHamClock();
+    status('waiting: HamClock is open in another tab');
+    showNotice('busy');
+    navigator.locks.request('hamclock', startHamClock);
+  });
+} else {
+  startHamClock();
+}
 </script>
-<script src="hamclock.js"></script>
 </body>
 </html>

@@ -59,9 +59,9 @@ The callers then parse the response themselves with `httpSkipHeader()` and line 
 In `__EMSCRIPTEN__` builds:
 
 1. `connect(host, port)` with port 80, 443 or 8080 doesn't open a socket. It marks the client as a
-   virtual HTTP connection and hands out a fake descriptor. Other ports log
-   `raw TCP is not available in the browser build` and fail, so the DX cluster and similar
-   features degrade the way they do when a host is unreachable.
+   virtual HTTP connection and hands out a fake descriptor. Other ports go through the page
+   server's TCP relay ([patch 0008](#tcp-relay-patch-0008)); without one they fail with a
+   message, the way an unreachable host does.
 2. `write()` collects the request text.
 3. The first `available()` or `read()` performs it. The C++ reads the request line and headers
    and builds a URL. If the host is `backend_host` and `HC_BACKEND_BASE` is set, the base replaces
@@ -272,6 +272,73 @@ requests carried `User-Agent: HamClock-UNIX/4.34b99`, and only hams.at's carried
 without the header, with a foreign `Host` or `Origin`, cross-site, to an unlisted host, or as a
 preflight were all refused.
 
+## TCP relay (patch 0008)
+
+The DX Cluster, HamAlert and Nearby APRS panes hold a telnet-style TCP connection open
+(`dxcluster.cpp`, `hamalert.cpp`, `aprscluster.cpp`), and rigctld, rotctld, flrig and gpsd use
+short TCP exchanges. They all go through `WiFiClient::connect(host, port)`, then `print()`,
+`available()`, `read()` (usually through `getTCPLine()`/`getTCPChar()`) and `stop()`, and they
+detect a dropped connection with `if (!client)` after reads.
+
+**In the browser build,** when the page sets `HC_TCP_BASE` (default `/tcp`), `connect()` to any
+port other than 80, 443 or 8080 uses the page server's relay. Every request carries
+`X-HamClock-Proxy: 1` and `s=`, a random id for this page made with `getentropy()` on first use:
+
+| Call | Request | Reply |
+|---|---|---|
+| `connect()` | `POST /tcp/open?host=H&port=P` | 200 with a connection id; 403 or 502 with the reason, which is printed |
+| `write()` | `POST /tcp/send?id=N` with the bytes | 200, or 410 if the connection has ended, which `stop()`s as a failed `write(2)` does |
+| (background) | `GET /tcp/poll?wait=20000&ids=1,2` | frames of `ID LENGTH EOF\n` then LENGTH bytes, once anything arrives or after 20 s |
+| `stop()` | `POST /tcp/close?id=N` | 200 |
+
+All are synchronous `emscripten_fetch()` calls, as in patch 0001.
+
+- **One poller for all connections.** A detached thread, started on the first relayed `connect()`,
+  long-polls for every open connection at once and appends what arrives to a per-connection
+  buffer, under one mutex with a condition variable. One poll at a time means the relay holds one
+  of the browser's six connections per origin, however many panes are open. When there are no
+  relayed connections, the thread sleeps on the condition variable rather than polling.
+- **Reads behave like a socket.** `available(pending_ms)` refills `peek[]` from the buffer, waiting
+  on the condition variable up to `pending_ms`, so `read()`'s usual timeout applies and the
+  panes' login code, which waits for prompts a character at a time, works unchanged.
+- **EOF.** When the server reports a connection ended, `available()` returns what's left, then
+  `stop()`s, so `!client` is true just as after `read(2)` returns 0. If a poll fails because the
+  server is gone, every relayed connection is marked ended and the panes see a lost connection
+  within a second or so, then retry on their own schedules. The poll's `ids=` list lets a
+  restarted server report connections it doesn't know as ended.
+- **Reused ids.** Each connection also gets a generation number, so if a restarted server hands
+  out an id a stale `WiFiClient` still holds, that client sees its connection as ended and its
+  `stop()` doesn't close the new one.
+
+**The relay in `devserver.py`** opens the socket, reads it on a thread per connection into a
+buffer (at most 1 MB unread, then it gives up on that connection), and answers polls from those
+buffers. It applies the same page-only checks as `/xhttp`, and also:
+
+- **Destinations:** public addresses only, on port 23 or 1024 and up. The host is resolved once
+  and the checked address is the one connected to, so DNS can't switch it to a private address
+  afterwards. `--tcp-allow HOST:PORT` permits anything else, such as `localhost:4532` for
+  rigctld.
+- **Limits:** 8 connections per page, 10 s to connect, polls wait at most 25 s.
+- **Cleanup:** a page that hasn't polled for 60 s has gone away (closed, reloaded or crashed), so
+  its connections are closed.
+- **Logging:** one line when a connection opens, one when it ends (who ended it, how long it
+  lasted, bytes each way), and one for each refusal. Never the data, so logins and passwords
+  stay out of the log. Successful `/tcp/` requests are left out of the access log, because polls
+  would fill it.
+
+Tested in headless Chromium against stand-ins for a DXSpider node, HamAlert and an APRS-IS server
+(`--tcp-upstream` points the real names at them). With the three panes on screen, all three
+connected at once and logged in; the stand-ins received `KV0VWD-55`, the HamAlert call and
+password, and the APRS-IS `user ... filter r/...` line. The APRS pane listed the stand-in's
+stations, and every DX cluster and HamAlert spot reached HamClock's spot parser. Stopping
+`devserver.py` made all three panes report a lost connection within a second. Requests without
+the header, with a foreign `Host` or `Origin`, cross-site, or as a preflight were refused, and an
+abandoned connection was closed after 69 s.
+
+Then on macOS against the real servers: the DX Cluster pane connected to `dxspider.co.uk:7300`
+and listed live spots, HamAlert delivered a spot from a telnet trigger, and Nearby APRS listed
+stations from `rotate.aprs2.net:14580`.
+
 ## Platform stubs (patch 0002)
 
 | Native behavior | Browser build |
@@ -336,9 +403,32 @@ request handling is in `ArduinoLib/WiFiClient.cpp`), the link flags in the Makef
 - Built with `-sINVOKE_RUN=0`. The page mounts IDBFS, waits for the IndexedDB load, then calls
   `callMain(['-b', host, '-e', '-1', '-r', '-1', '-w', '-1', '-o', …])`. `-e/-r/-w -1` disable
   the RESTful and Live Web servers, and `-o` sends the log to the browser console.
-- `HC_BACKEND_BASE` is set in the Emscripten environment in `preRun`.
-- The defaults at the top of the file (`DEFAULT_BACKEND_HOST`, `DEFAULT_BACKEND_BASE`) are the
-  only things a deployer should need to edit.
+- `HC_BACKEND_BASE`, `HC_XHTTP_BASE` and `HC_TCP_BASE` are set in the Emscripten environment in
+  `preRun`.
+- **One tab at a time.** Every tab of the page shares one IndexedDB `eeprom`, so two running
+  HamClocks would overwrite each other's settings. The page loads `hamclock.js` only once it holds
+  a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) named `hamclock`,
+  which it keeps until the tab closes or reloads. A second tab shows "already open in another
+  tab" and queues for the lock, so it starts by itself when the first tab goes. Reloads, including
+  HamClock's own restarts, release and retake the lock without a notice. Browsers without
+  `navigator.locks` just start.
+- **Watching the server.** The page keeps a Server-Sent Events connection to `/events`
+  (`DEFAULT_EVENTS`, `?events=`). `devserver.py` catches Ctrl-C, SIGTERM and SIGHUP, sends each
+  open page `event: stopped`, waits half a second and exits. The page then shows "HamClock's
+  local communication process has stopped" and saves settings at once. The notices call
+  `devserver.py` "HamClock's local communication process" rather than a server, for people who
+  don't think in those terms. A drop without the event shows "Can't reach HamClock's local
+  communication process", but only if it lasts 3 seconds. EventSource reconnects by itself
+  (the server asks for every 2 s), and the notice goes away when it does. HamClock is never
+  paused: its fetches fail and the relayed panes report lost connections, as natively during a
+  network outage, and they recover when the server returns. If the first connection never
+  opens, the server has no `/events` (say, the page is hosted elsewhere) and the page stops
+  watching.
+- **Counting pages.** `devserver.py` logs `PAGE connected (n open)` and `PAGE disconnected`. It
+  checks every second whether each tab has hung up, so the count stays right; a launcher can use
+  it to know whether a tab is still open.
+- The defaults at the top of the file (`DEFAULT_BACKEND_HOST`, `DEFAULT_BACKEND_BASE`,
+  `DEFAULT_XHTTP_BASE`, `DEFAULT_TCP_BASE`) are the only things a deployer should need to edit.
 
 ## Build flags
 
@@ -369,9 +459,14 @@ example `map-D-2640x1320-*.bmp.z` at 3200x1920), which OHB provides.
 
 ## Limitations and ideas
 
-- **Raw TCP and UDP** (DX cluster, APRS-IS, HamAlert, hamlib, flrig, gpsd, WSJT-X): Emscripten
-  can carry POSIX sockets over WebSockets to a relay. A public relay would need a destination
-  allowlist, or it becomes an open proxy.
+- **UDP** (WSJT-X and other UDP spot sources for the DX Cluster pane): the relay is TCP only. A
+  UDP listener in `devserver.py` that queues datagrams for the page would work the same way.
+- **The TCP relay on a hosted copy** would make connections on every user's behalf, with their
+  logins passing through it. Fine for a local `devserver.py`; a question for OHB otherwise.
+- **Why not WebSockets?** Emscripten can carry POSIX sockets over WebSockets, but a WebSocket's
+  messages arrive on the event loop of the thread that owns it, and HamClock's threads never
+  return to theirs. Long-polling with synchronous requests fits a blocking program, and needs
+  nothing beyond Python's standard library on the server.
 - **Blocking fetches**: one request at a time per HamClock thread, the same as native. Could
   become asynchronous later, but that would change upstream code paths.
 - **PWA**: a manifest and service worker would let it be installed on a home screen (iPad) and
