@@ -127,11 +127,36 @@ class Launcher:
 
     def build_menu(self):
         bar = tk.Menu(self.root)
+
+        # Edit: each item sends the same request as its keyboard shortcut to whichever part of the
+        # window has focus, so it does exactly what the keys do. On macOS the menu takes the
+        # Command keys; elsewhere the labels are only reminders and the keys work as before.
+        mac = self.root.tk.call('tk', 'windowingsystem') == 'aqua'
+        key = (lambda k: f'Command-{k}') if mac else (lambda k: f'Ctrl+{k}')
+        editm = tk.Menu(bar, tearoff=False)
+        editm.add_command(label='Cut', accelerator=key('X'), command=lambda: self.edit('<<Cut>>'))
+        editm.add_command(label='Copy', accelerator=key('C'), command=lambda: self.edit('<<Copy>>'))
+        editm.add_command(label='Paste', accelerator=key('V'), command=lambda: self.edit('<<Paste>>'))
+        editm.add_separator()
+        editm.add_command(label='Select All', accelerator=key('A'),
+                          command=lambda: self.edit('<<SelectAll>>'))
+        bar.add_cascade(label='Edit', menu=editm, underline=0)
+
         helpm = tk.Menu(bar, tearoff=False)
         helpm.add_command(label='README on GitHub', command=lambda: webbrowser.open(REPO + '#readme'))
         helpm.add_command(label='About ' + APP, command=self.about)
-        bar.add_cascade(label='Help', menu=helpm)
+        bar.add_cascade(label='Help', menu=helpm, underline=0)
         self.root.config(menu=bar)
+
+    def edit(self, request):
+        """an Edit menu item: the Host:Port box if it's being typed in, otherwise the output"""
+        w = self.root.focus_get()
+        if w is not self.custom:
+            w = self.text
+            if request in ('<<Cut>>', '<<Paste>>'):
+                return                  # the output is read-only
+            w.focus_set()
+        w.event_generate(request)
 
     def build_window(self):
         main = ttk.Frame(self.root, padding=12)
