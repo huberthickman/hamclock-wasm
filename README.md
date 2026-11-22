@@ -15,10 +15,10 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 
 ## What this is
 
-- These patches apply to `openhamclock/hamclock` at
+- The real client, not a rewrite. These patches apply to `openhamclock/hamclock` at
   [`b9db5fb`](https://github.com/openhamclock/hamclock/commit/b9db5fbe519faf84ee1350019eadb8747f1cd1e1)
   (v4.34b99) and build its existing `_WEB_ONLY` variant with Emscripten.
-- The change is small: **673 lines added and 2 changed across 13 files**, in seven patches. All code
+- The change is small: **940 lines added and 2 changed across 13 files**, in eight patches. All code
   changes are inside `#if defined(__EMSCRIPTEN__)`, plus a new `hamclock-wasm` Makefile target.
   The native `hamclock-web-800x480` build has been checked with g++ after patching.
 - The backend protocol is unchanged. The client still sends its usual
@@ -29,10 +29,10 @@ spots, HamQSL band conditions, the ISS pass, the weather map and the sunspot his
 
 | | |
 |---|---|
-| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); restarts HamClock asks for, such as restoring a saved configuration; the hams.at Sat Alerts and Meshtastic Mesh Mon panes, including a hams.at API key, through `devserver.py`'s proxy; settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
-| **Tested on** | Against live ohb.hamclock.app: Chrome on macOS, Firefox on macOS and Linux, Edge on Windows, Safari on macOS. Also headless Chromium on Linux (all sizes, local backend) |
-| **Not tested** | Safari on iPad; a direct cross-origin connection to OHB |
-| **Not available** | Anything that needs raw TCP or UDP: DX cluster, APRS-IS, HamAlert, rigctld, flrig, rotctld, gpsd, WSJT-X UDP. Also the RESTful API and Live Web servers (a page can't listen on ports), I2C/GPIO sensors, and the menu items a browser can't honor: upgrade, Reboot/Shutdown computer, and Restart/Exit/Factory reset HamClock (reload the page to restart; clear site data to reset) |
+| **Works** | First-run Setup; touch, mouse and keyboard; the map and panes filled from OHB (space weather, SDO, PSK Reporter, POTA spots, band conditions, satellites, weather maps); links HamClock opens (new tab, or an in-page overlay for sites that allow framing); restarts HamClock asks for, such as restoring a saved configuration; the hams.at Sat Alerts and Meshtastic Mesh Mon panes, including a hams.at API key, through `devserver.py`'s proxy; the DX Cluster, HamAlert and Nearby APRS panes, through `devserver.py`'s TCP relay; settings that survive a page reload; all four sizes, 800x480 to 3200x1920 |
+| **Tested on** | Against live ohb.hamclock.app: Chrome on macOS, Firefox on macOS and Linux, Edge on Windows, Safari on macOS. The DX Cluster (dxspider.co.uk), HamAlert and Nearby APRS (rotate.aprs2.net) panes through the TCP relay, on macOS. Also headless Chromium on Linux (all sizes, local backend) |
+| **Not tested** | Safari on iPad; a direct cross-origin connection to OHB; rigctld, rotctld, flrig and gpsd through the relay (they should work with `--tcp-allow`, see [below](#hamalert-dx-clusters-and-aprs-is)) |
+| **Not available** | UDP, so the DX Cluster pane's WSJT-X and other UDP spot sources. Also the RESTful API and Live Web servers (a page can't listen on ports), I2C/GPIO sensors, and the menu items a browser can't honor: upgrade, Reboot/Shutdown computer, and Restart/Exit/Factory reset HamClock (reload the page to restart; clear site data to reset) |
 
 **Browsers:** Chrome and Firefox are recommended.
 
@@ -70,9 +70,22 @@ repo's tag (override with `VERSION=`). Anyone who downloads a zip still needs to
 
 `build.sh` clones upstream at the pinned commit, applies `patches/`, builds and copies the page
 into `dist/<size>/`. `devserver.py` serves it with the headers the browser needs, forwards
-`/ohb/*` to `http://ohb.hamclock.app`, and forwards `/xhttp/*` to the two third-party APIs HamClock
-uses that browsers can't reach directly (see [Third-party APIs](#third-party-apis)). It listens on
-`localhost` only; `python3 devserver.py --help` lists its options.
+`/ohb/*` to `http://ohb.hamclock.app`, forwards `/xhttp/*` to the two third-party APIs HamClock
+uses that browsers can't reach directly (see [Third-party APIs](#third-party-apis)), and relays
+the TCP connections of the DX Cluster, HamAlert and Nearby APRS panes (see
+[HamAlert, DX clusters and APRS-IS](#hamalert-dx-clusters-and-aprs-is)). It listens on
+`localhost` only; `python3 devserver.py --help` lists its options. It prints a line for each
+relayed connection and anything it refuses, which is the place to look if a pane won't connect.
+
+- **Stopping the server.** If you stop `devserver.py` (Ctrl-C), the HamClock tab covers itself with
+  "HamClock's local communication process has stopped". If `devserver.py` disappears without
+  stopping cleanly (a crash, or the computer sleeping), the tab shows "Can't reach HamClock's
+  local communication process" after a few seconds. Either way HamClock keeps running
+  underneath: start `devserver.py` again and the notice goes away and HamClock carries on. Or
+  just close the tab; your settings are already saved in the browser.
+- **One tab at a time.** Two HamClock tabs in the same browser would overwrite each other's
+  settings, so a second tab says HamClock is already open, and starts by itself once you close
+  the first.
 
 `dist/<size>/` then contains:
 
@@ -94,6 +107,9 @@ You can change the defaults in the URL:
   the backend itself), or `https://host` (a server with CORS enabled).
 - `?xhttp=` sets where third-party APIs are fetched through: `/xhttp` (the default, via
   `devserver.py`) or empty, to fetch them straight from the browser.
+- `?tcp=` sets the TCP relay: `/tcp` (the default, via `devserver.py`) or empty for none.
+- `?events=` sets the stream the page watches to tell that its server has stopped: `/events` (the
+  default) or empty to not watch. A server without one is simply not watched.
 - `?args=` passes extra HamClock command-line arguments.
 
 ## Where settings live
@@ -138,6 +154,44 @@ HamClock's user agent.
   which blocks DNS-rebinding tricks. Anything else gets a 403 with the reason in the log.
 - **Your API key is forwarded, never logged.** The log only notes that a key was present.
 
+## HamAlert, DX clusters and APRS-IS
+
+The DX Cluster, HamAlert and Nearby APRS panes keep a plain TCP connection open to a server
+(telnet-style), which browsers can't do. `devserver.py` makes those connections for the page:
+HamClock asks it to connect, sends through it, and collects what arrives. The panes, their
+Setup fields and their logins are unchanged.
+
+| Pane | Connects to | Setup |
+|---|---|---|
+| DX Cluster | your cluster node, eg `dxc.nc7j.com:7373` | cluster host, port and login |
+| HamAlert | `hamalert.org:7300` | HamAlert call and telnet password |
+| Nearby APRS | an APRS-IS server, eg `rotate.aprs2.net:14580` | APRS-IS host, port and radius |
+
+- **No router setup.** These are outgoing connections from your computer, the same ones the
+  native HamClock makes. Don't forward ports to `devserver.py`: it's meant to be reached only from
+  your own browser.
+- **Where it may connect.** Public addresses, on port 23 or ports 1024 and up. Addresses on your
+  own computer or network, and other low ports, are refused unless you allow them with
+  `--tcp-allow HOST:PORT`, for example `--tcp-allow localhost:4532` for rigctld. `--no-tcp` turns
+  the relay off.
+- **Only this page can use it,** with the same checks as `/xhttp` above.
+- **Logins pass through, and aren't logged.** The log shows each connection's host, port, byte
+  counts and how it ended, never what was sent. As with the native client, the cluster and
+  HamAlert logins travel unencrypted, because that's how those services work.
+- **Lost connections behave as they do natively.** If `devserver.py` stops, HamClock notices
+  within a few seconds and each pane shows its usual error and retries. If the page is closed or
+  reloaded, `devserver.py` closes its connections within about a minute.
+
+A typical log:
+
+```
+TCP #1 dxc.nc7j.com:7373 open
+TCP #2 hamalert.org:7300 open
+TCP #3 rotate.aprs2.net:14580 open
+TCP refused 192.168.1.20:4532: 192.168.1.20 is a private or local address (see --tcp-allow)
+TCP #2 hamalert.org:7300 closed by HamClock after 12m04s, 5810 bytes in, 61 out
+```
+
 ## How it works
 
 ```
@@ -170,6 +224,9 @@ HamClock's user agent.
   open a tab because the tap was too long ago, a bar offers the link to click instead.
 - **Third-party APIs:** hams.at and the Meshtastic map don't allow requests from other websites,
   so the page fetches them through `devserver.py`'s `/xhttp/` proxy, with your hams.at API key.
+- **TCP:** the DX cluster, HamAlert and APRS-IS connections go through `devserver.py`'s `/tcp/`
+  relay. One background thread collects what arrives on all of them, and HamClock reads it as if
+  from a socket.
 - **Restarts:** HamClock can't re-run itself in a browser, so when it needs to restart (restoring
   a saved configuration, resetting to defaults), it asks the page to save settings and reload.
 - **Storage:** `~/.hamclock` (the settings file and cached maps) lives in IndexedDB.
@@ -195,10 +252,11 @@ hamclock-wasm/
 │   ├── 0004-Makefile-add-hamclock-wasm-target.patch
 │   ├── 0005-Hand-openURL-requests-to-the-browser-page.patch
 │   ├── 0006-Restart-by-reloading-the-browser-page.patch
-│   └── 0007-Fetch-third-party-https-APIs-through-the-page-s-prox.patch
+│   ├── 0007-Fetch-third-party-https-APIs-through-the-page-s-prox.patch
+│   └── 0008-Relay-raw-TCP-through-the-page-s-server-HamAlert-DX-.patch
 ├── web/
 │   ├── index.html              host page: canvas, input, links, storage, configuration
-│   └── devserver.py            local server: COOP/COEP headers, /ohb and /xhttp proxies (stdlib only)
+│   └── devserver.py            local server: COOP/COEP headers, /ohb and /xhttp proxies, /tcp relay (stdlib only)
 ├── scripts/
 │   ├── build.sh                clone upstream, apply patches, build, collect dist/<size>/
 │   └── build_all.sh            build.sh for every size, optionally zipped for a release
@@ -219,6 +277,7 @@ hamclock-wasm/
 | 0005 | `qrz.cpp`, `liveweb.cpp`, `HamClock.h`, `wasm_glue.cpp` | `openURL()` always stages URLs as for Live Web; the input thread passes them to the page through a lock-free slot |
 | 0006 | `ESPHamClock.cpp`, `HamClock.h`, `wasm_glue.cpp` | `doReboot()` asks the page to save settings and reload, carrying `-K`/`-0` to the next start |
 | 0007 | `ArduinoLib/WiFiClient.{h,cpp}` | curl commands keep their `-A` and `-H` headers (the hams.at API key); third-party https goes through the page's `/xhttp/` proxy |
+| 0008 | `ArduinoLib/WiFiClient.{h,cpp}` | Other TCP ports go through the page's `/tcp/` relay: connect, send, and one long-polling thread for everything that arrives; a dropped relay ends the connections as EOF would |
 
 To read them as commits rather than patch files:
 `git am patches/*.patch` on a branch at `b9db5fb`.
@@ -232,8 +291,10 @@ To read them as commits rather than patch files:
    [docs/OHB-BACKEND.md](docs/OHB-BACKEND.md) compares the options, with NGINX sketches.
 3. **User-Agent telemetry.** Is `X-HamClock-UA` acceptable for carrying what the native client
    puts in `User-Agent`? `version.pl` parses that string.
-4. **Raw-TCP features.** Is the DX cluster worth a WebSocket-to-TCP relay with a destination
-   allowlist, or is it out of scope for a browser client?
+4. **TCP features.** `devserver.py` now relays the DX cluster, HamAlert and APRS-IS connections
+   for a local install. A hosted copy would need that relay on the server, which would then make
+   long-lived connections on users' behalf, with their cluster and HamAlert logins passing
+   through it. Is that something OHB would want to run, or should those panes stay local-only?
 5. **Third-party APIs.** hams.at and the Meshtastic map API send no CORS headers, so a hosted
    copy of this page would have to proxy them, and a proxy sees users' hams.at API keys. Would
    it be worth asking both to allow cross-origin requests? See

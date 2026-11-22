@@ -1,0 +1,408 @@
+From a11287b60bec30bd1ab8011c86c76d871935dc39 Mon Sep 17 00:00:00 2001
+From: Hubert Hickman <hubert.hickman@gmail.com>
+Date: Sat, 21 Nov 2026 15:17:53 -0600
+Subject: [PATCH 8/8] Relay raw TCP through the page's server: HamAlert, DX
+ clusters, APRS-IS
+
+Browsers can't open TCP connections, so the HamAlert, DX Cluster and
+Nearby APRS panes could not connect in the browser build. When the page
+sets HC_TCP_BASE (eg "/tcp"), WiFiClient::connect() to a port other than
+80, 443 or 8080 now asks the page's server to open the connection:
+
+  POST HC_TCP_BASE/open?host=H&port=P   connect; replies with an id
+  POST HC_TCP_BASE/send?id=N            write the request body
+  GET  HC_TCP_BASE/poll?wait=MS&ids=..  wait for data on any connection
+  POST HC_TCP_BASE/close?id=N           stop()
+
+All carry X-HamClock-Proxy and a random id for this page. One background
+thread long-polls for every relayed connection at once, so the relay uses
+a single browser connection however many panes are open, and files what
+arrives by connection. available() and read() take from there, waiting
+the same timeouts they do on a socket, so getTCPLine() and the panes'
+login code work unchanged. When the server reports a connection ended,
+or can no longer be reached, available() stop()s as on EOF, and each
+pane's own lost-connection handling takes over.
+
+Without HC_TCP_BASE, connect() fails with a message as before.
+
+All changes are inside #if __EMSCRIPTEN__.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ESPHamClock/ArduinoLib/WiFiClient.cpp | 270 +++++++++++++++++++++++++-
+ ESPHamClock/ArduinoLib/WiFiClient.h   |   7 +
+ 2 files changed, 272 insertions(+), 5 deletions(-)
+
+diff --git a/ESPHamClock/ArduinoLib/WiFiClient.cpp b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+index ef7e0e6..50c80a2 100644
+--- a/ESPHamClock/ArduinoLib/WiFiClient.cpp
++++ b/ESPHamClock/ArduinoLib/WiFiClient.cpp
+@@ -9,7 +9,9 @@
+ #if defined(__EMSCRIPTEN__)
+ #include <string>
+ #include <vector>
++#include <map>
+ #include <strings.h>
++#include <pthread.h>
+ #include <emscripten/fetch.h>
+ 
+ /* browser build: HTTP over Emscripten's Fetch API.
+@@ -232,6 +234,236 @@ bool WiFiClient::wasmPerform()
+     return (true);
+ }
+ 
++/* browser build: other TCP through the page server's relay.
++ *
++ * HamAlert, DX clusters and APRS-IS need plain TCP, which browsers can't do. When the page sets
++ * HC_TCP_BASE (eg "/tcp", which devserver.py provides), connect() to a port other than 80, 443 or
++ * 8080 asks that server to open the connection, write() sends through it, and one background
++ * thread long-polls the server for whatever has arrived on all of this page's connections and files
++ * it by connection. available() and read() take it from there, waiting the same timeouts they
++ * would on a socket. When the server reports a connection ended, available() stop()s as on EOF,
++ * so HamClock's own lost-connection handling works unchanged.
++ */
++
++struct RelayConn {
++    std::string rx;                         // arrived, not yet read
++    bool eof;                               // nothing more will arrive
++    unsigned gen;                           // tells a reused id from an earlier connection
++};
++static pthread_mutex_t relay_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t relay_cv = PTHREAD_COND_INITIALIZER;     // data, EOF, or a new connection
++static std::map<int, RelayConn> relay_conns;
++static unsigned relay_gen;
++static char relay_sid[33];                  // identifies this page's connections to the relay
++static bool relay_polling;                  // poller thread is running
++
++// perform a relay request (op is open, send, close or poll) synchronously.
++// return the HTTP status, 0 if the server could not be reached, and the reply in *resp.
++static int relayRequest (const char *method, const char *op, const std::string &query,
++                                const uint8_t *body, int body_len, std::string *resp)
++{
++    const char *base = getenv ("HC_TCP_BASE");
++    std::string url = std::string (base ? base : "") + "/" + op + "?s=" + relay_sid + "&" + query;
++    const char *headers[] = {"X-HamClock-Proxy", "1", "Content-Type", "application/octet-stream", NULL};
++
++    emscripten_fetch_attr_t attr;
++    emscripten_fetch_attr_init (&attr);
++    strcpy (attr.requestMethod, method);
++    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS | EMSCRIPTEN_FETCH_REPLACE;
++    attr.requestHeaders = headers;
++    if (body && body_len > 0) {
++        attr.requestData = (const char *) body;
++        attr.requestDataSize = body_len;
++    }
++    emscripten_fetch_t *f = emscripten_fetch (&attr, url.c_str());
++    if (!f)
++        return (0);
++    int status = f->status;
++    if (resp) {
++        resp->assign (f->data ? f->data : "", (size_t) f->numBytes);
++        if (status != 200)                  // a message saying why: drop its newline
++            while (!resp->empty() && (resp->back() == '\n' || resp->back() == '\r'))
++                resp->pop_back();
++    }
++    emscripten_fetch_close (f);
++    return (status);
++}
++
++// thread: collect whatever arrives on any relayed connection while there are any.
++static void *relayPoller (void *)
++{
++    bool failing = false;
++    for (;;) {
++        // wait for a connection, then poll for all of them
++        std::string ids;
++        pthread_mutex_lock (&relay_lock);
++        while (relay_conns.empty())
++            pthread_cond_wait (&relay_cv, &relay_lock);
++        for (auto &rc : relay_conns)
++            if (!rc.second.eof)
++                ids += (ids.empty() ? "" : ",") + std::to_string (rc.first);
++        pthread_mutex_unlock (&relay_lock);
++
++        std::string resp;
++        int status = relayRequest ("GET", "poll", "wait=20000&ids=" + ids, NULL, 0, &resp);
++        if (status != 200) {
++            // the page's server stopped or refuses: end every connection so HamClock sees them drop
++            if (!failing)
++                printf ("WiFiCl: TCP relay poll failed (%d %s): ending relayed connections\n", status,
++                                                            status ? resp.c_str() : "unreachable");
++            failing = true;
++            pthread_mutex_lock (&relay_lock);
++            for (auto &rc : relay_conns)
++                rc.second.eof = true;
++            pthread_cond_broadcast (&relay_cv);
++            pthread_mutex_unlock (&relay_lock);
++            usleep (2000000);
++            continue;
++        }
++        failing = false;
++
++        // frames of "ID LENGTH EOF\n" then LENGTH bytes
++        pthread_mutex_lock (&relay_lock);
++        size_t pos = 0;
++        while (pos < resp.size()) {
++            size_t nl = resp.find ('\n', pos);
++            int id, eof;
++            long len;
++            if (nl == std::string::npos || sscanf (resp.c_str() + pos, "%d %ld %d", &id, &len, &eof) != 3
++                                        || len < 0 || nl + 1 + (size_t)len > resp.size()) {
++                printf ("WiFiCl: TCP relay sent a bad poll reply\n");
++                break;
++            }
++            auto it = relay_conns.find (id);
++            if (it != relay_conns.end()) {
++                it->second.rx.append (resp, nl + 1, (size_t)len);
++                if (eof)
++                    it->second.eof = true;
++            }
++            pos = nl + 1 + (size_t)len;
++        }
++        pthread_cond_broadcast (&relay_cv);
++        pthread_mutex_unlock (&relay_lock);
++    }
++    return (NULL);
++}
++
++bool WiFiClient::relayConnect (const char *host, int port)
++{
++    if (!relay_sid[0]) {
++        uint8_t r[16];
++        if (getentropy (r, sizeof(r)) != 0)
++            for (size_t i = 0; i < sizeof(r); i++)
++                r[i] = (uint8_t) rand();
++        for (size_t i = 0; i < sizeof(r); i++)
++            snprintf (relay_sid + 2*i, 3, "%02x", r[i]);
++    }
++
++    std::string q = "host=";
++    for (const char *c = host; *c; c++) {
++        char hex[4];
++        if (isalnum ((unsigned char)*c) || *c == '.' || *c == '-')
++            q += *c;
++        else {
++            snprintf (hex, sizeof(hex), "%%%02X", (unsigned char)*c);
++            q += hex;
++        }
++    }
++    q += "&port=" + std::to_string (port);
++
++    std::string resp;
++    int status = relayRequest ("POST", "open", q, NULL, 0, &resp);
++    int id = status == 200 ? atoi (resp.c_str()) : 0;
++    if (id <= 0) {
++        printf ("WiFiCl: %s:%d: %s\n", host, port, status ? resp.c_str() : "TCP relay not reachable");
++        errno = ECONNREFUSED;
++        return (false);
++    }
++
++    pthread_mutex_lock (&relay_lock);
++    RelayConn &rc = relay_conns[id];
++    rc.rx.clear();
++    rc.eof = false;
++    rc.gen = ++relay_gen;
++    m_relayGen = rc.gen;
++    if (!relay_polling) {
++        pthread_t tid;
++        if (pthread_create (&tid, NULL, relayPoller, NULL) == 0) {
++            pthread_detach (tid);
++            relay_polling = true;
++        } else
++            printf ("WiFiCl: can not start TCP relay poller\n");
++    }
++    pthread_cond_broadcast (&relay_cv);
++    pthread_mutex_unlock (&relay_lock);
++
++    m_relayId = id;
++    socket = wasm_next_fd++;
++    n_peek = next_peek = 0;
++    if (debugLevel (DEBUG_NET, 1))
++        printf ("WiFiCl: %s:%d relayed as #%d\n", host, port, id);
++    return (true);
++}
++
++// like available() on a socket: refill peek[] from what has arrived, waiting up to pending_ms.
++int WiFiClient::relayAvailable (int pending_ms)
++{
++    struct timespec until;
++    clock_gettime (CLOCK_REALTIME, &until);
++    until.tv_sec += pending_ms / 1000;
++    until.tv_nsec += (long)(pending_ms % 1000) * 1000000L;
++    if (until.tv_nsec >= 1000000000L) {
++        until.tv_sec += 1;
++        until.tv_nsec -= 1000000000L;
++    }
++
++    int ret = 0;
++    bool ended = false;
++    pthread_mutex_lock (&relay_lock);
++    for (;;) {
++        auto it = relay_conns.find (m_relayId);
++        if (it == relay_conns.end() || it->second.gen != m_relayGen) {
++            ended = true;
++            break;
++        }
++        RelayConn &rc = it->second;
++        if (!rc.rx.empty()) {
++            int n = rc.rx.size() < sizeof(peek) ? (int)rc.rx.size() : (int)sizeof(peek);
++            memcpy (peek, rc.rx.data(), n);
++            rc.rx.erase (0, n);
++            n_peek = n;
++            next_peek = 0;
++            ret = 1;
++            break;
++        }
++        if (rc.eof) {
++            ended = true;
++            break;
++        }
++        if (pending_ms <= 0 || pthread_cond_timedwait (&relay_cv, &relay_lock, &until) == ETIMEDOUT)
++            break;
++    }
++    pthread_mutex_unlock (&relay_lock);
++
++    if (ended)
++        stop();                             // like EOF on a real socket
++    return (ret);
++}
++
++void WiFiClient::relayStop()
++{
++    pthread_mutex_lock (&relay_lock);
++    auto it = relay_conns.find (m_relayId);
++    bool ours = it != relay_conns.end() && it->second.gen == m_relayGen;
++    if (ours)
++        relay_conns.erase (it);
++    pthread_mutex_unlock (&relay_lock);
++
++    if (ours)
++        relayRequest ("POST", "close", "id=" + std::to_string (m_relayId), NULL, 0, NULL);
++    m_relayId = 0;
++}
++
+ #endif // __EMSCRIPTEN__
+ 
+ // default constructor
+@@ -248,6 +480,8 @@ WiFiClient::WiFiClient()
+     m_req = nullptr;
+     m_resp = nullptr;
+     m_xhdrs = nullptr;
++    m_relayId = 0;
++    m_relayGen = 0;
+     wasmReset();
+ #endif
+ }
+@@ -268,6 +502,8 @@ WiFiClient::WiFiClient(int fd)
+     m_req = nullptr;
+     m_resp = nullptr;
+     m_xhdrs = nullptr;
++    m_relayId = 0;
++    m_relayGen = 0;
+     wasmReset();
+ #endif
+ }
+@@ -458,8 +694,9 @@ bool WiFiClient::connect(const char *host, int port)
+     m_pipe = nullptr;
+ 
+ #if defined(__EMSCRIPTEN__)
+-    // browser build: HTTP becomes a virtual connection performed later with XHR; browsers can
+-    // not open raw TCP (DX cluster, APRS-IS, rigctld, gpsd...) without a WebSocket relay.
++    // browser build: HTTP becomes a virtual connection performed later with the Fetch API. Browsers
++    // can not open raw TCP (HamAlert, DX clusters, APRS-IS...), so other ports go through the
++    // page server's relay when it has one.
+     stop();
+     if (port == 80 || port == 443 || port == 8080) {
+         m_isHttp = true;
+@@ -469,7 +706,10 @@ bool WiFiClient::connect(const char *host, int port)
+         n_peek = next_peek = 0;
+         return (true);
+     }
+-    printf ("WiFiCl: %s:%d: raw TCP is not available in the browser build\n", host, port);
++    const char *tb = getenv ("HC_TCP_BASE");
++    if (tb && tb[0])
++        return (relayConnect (host, port));
++    printf ("WiFiCl: %s:%d: raw TCP needs the page's TCP relay, which it does not have\n", host, port);
+     errno = ENOTSUP;
+     return (false);
+ #endif
+@@ -529,7 +769,7 @@ void WiFiClient::setNoDelay(bool on)
+ {
+     // control Nagle algorithm
+ #if defined(__EMSCRIPTEN__)
+-    if (m_isHttp) return;
++    if (m_isHttp || m_relayId) return;
+ #endif
+     socklen_t flag = on;
+     if (setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, (void *) &flag, sizeof(flag)) < 0)
+@@ -539,6 +779,13 @@ void WiFiClient::setNoDelay(bool on)
+ void WiFiClient::stop()
+ {
+ #if defined(__EMSCRIPTEN__)
++    if (m_relayId) {
++        relayStop();
++        socket = -1;
++        n_peek = 0;
++        next_peek = 0;
++        return;
++    }
+     if (m_isHttp) {
+         wasmReset();
+         socket = -1;
+@@ -617,6 +864,8 @@ int WiFiClient::available (int pending_ms)
+         return (1);
+ 
+ #if defined(__EMSCRIPTEN__)
++    if (m_relayId)
++        return (relayAvailable (pending_ms));
+     if (m_isHttp) {
+         if (!m_fetched && !wasmPerform()) {
+             stop();
+@@ -709,6 +958,17 @@ int WiFiClient::write (const uint8_t *buf, int n)
+         return (0);
+ 
+ #if defined(__EMSCRIPTEN__)
++    if (m_relayId) {
++        std::string resp;
++        int status = relayRequest ("POST", "send", "id=" + std::to_string (m_relayId), buf, n, &resp);
++        if (status != 200) {
++            if (debugLevel (DEBUG_NET, 1))
++                printf ("WiFiCl: relayed write: %d %s\n", status, resp.c_str());
++            stop();                         // as a failed write(2) does
++            return (0);
++        }
++        return (n);
++    }
+     if (m_isHttp) {
+         if (m_req_len + n + 1 > m_req_max) {
+             m_req_max = (m_req_len + n + 1) * 2;
+@@ -853,7 +1113,7 @@ void WiFiClient::println (uint32_t i)
+ IPAddress WiFiClient::remoteIP()
+ {
+ #if defined(__EMSCRIPTEN__)
+-    if (m_isHttp)
++    if (m_isHttp || m_relayId)
+         return (IPAddress(0,0,0,0));
+ #endif
+     struct sockaddr_in sa;
+diff --git a/ESPHamClock/ArduinoLib/WiFiClient.h b/ESPHamClock/ArduinoLib/WiFiClient.h
+index 0bb30a5..82183aa 100644
+--- a/ESPHamClock/ArduinoLib/WiFiClient.h
++++ b/ESPHamClock/ArduinoLib/WiFiClient.h
+@@ -96,6 +96,13 @@ private:
+     int m_resp_len, m_resp_pos;
+     void wasmReset();
+     bool wasmPerform();
++
++    // other ports: a TCP connection through the page server's relay, if it has one
++    int m_relayId;                          // the relay's connection id, 0 if none
++    unsigned m_relayGen;                    // which use of that id is ours
++    bool relayConnect (const char *host, int port);
++    int relayAvailable (int pending_ms);
++    void relayStop();
+ #endif
+ 
+ };
+-- 
+2.43.0
+
