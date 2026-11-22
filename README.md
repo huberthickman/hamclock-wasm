@@ -118,13 +118,15 @@ You can change the defaults in the URL:
 
 ## The launcher
 
-`launcher.py` is a small window for starting HamClock without a terminal, laid out like the
-[HamClock Launcher](https://machamclocklauncher.org) for the Mac. It's in the all-sizes release
-zip and in `dist/` after a build, and needs only Python 3 with tkinter, which the
-[python.org](https://www.python.org/downloads/) installers for macOS and Windows include.
+`launcher.py` is a small window for choosing a size and backend and starting HamClock, laid out
+like the [HamClock Launcher](https://machamclocklauncher.org) for the Mac. It's in the all-sizes
+release zip and in `dist/` after a build, and needs only Python 3 with tkinter, which the
+[python.org](https://www.python.org/downloads/) installers for macOS and Windows include. Start it
+from a terminal, in the unzipped release folder (or use `dist/launcher.py` after a build):
 
 ```sh
-python3 launcher.py                    # from the unzipped release, or: python3 dist/launcher.py
+python3 launcher.py        # macOS and Linux
+py launcher.py             # Windows (the python.org installer adds the "py" command)
 ```
 
 ![The launcher on macOS, running the 3200x1920 build against ohb.hamclock.app](docs/screenshots/launcher-macos.png)
@@ -132,15 +134,6 @@ python3 launcher.py                    # from the unzipped release, or: python3 
 *The launcher on macOS, running the 3200x1920 build against ohb.hamclock.app, with one browser
 tab connected. HamClock's own output (`HC:` lines) is interleaved with `devserver.py`'s; "Show
 file requests" is on, so the page's file requests show too.*
-
-On a Mac you can double-click `HamClock Launcher.command` instead. Because it was downloaded,
-macOS may refuse it the first time: allow it under System Settings → Privacy & Security, or use
-the command above.
-
-On Windows, double-click `HamClock Launcher.bat`. It finds Python (the `py` command the python.org
-installer adds, or `python`), checks that it has tkinter, and starts the launcher without a
-console window. If Python is missing or unsuitable, it says so and how to fix it. Windows may
-warn about running a downloaded file the first time: choose More info → Run anyway.
 
 ![The launcher on Windows 11, running the 1600x960 build against ohb.hamclock.app](docs/screenshots/launcher-windows.png)
 
@@ -303,7 +296,6 @@ More detail is in [docs/DESIGN.md](docs/DESIGN.md).
 ```
 hamclock-wasm/
 ├── README.md
-├── .gitattributes              keeps the Windows .bat file's CRLF line endings
 ├── LICENSE                     MIT, same as upstream
 ├── patches/                    git format-patch series against openhamclock/hamclock@b9db5fb
 │   ├── 0001-WiFiClient-perform-HTTP-with-the-Emscripten-Fetch-AP.patch
@@ -319,9 +311,7 @@ hamclock-wasm/
 │   ├── index.html              host page: canvas, input, links, storage, configuration
 │   ├── devserver.py            local server: COOP/COEP headers, /ohb and /xhttp proxies, /tcp relay,
 │   │                           /events and /log for the page (stdlib only)
-│   ├── launcher.py             window to choose a size and backend and run devserver.py (tkinter)
-│   ├── HamClock Launcher.command   macOS: double-click to run launcher.py
-│   └── HamClock Launcher.bat       Windows: double-click to run launcher.py
+│   └── launcher.py             window to choose a size and backend and run devserver.py (tkinter)
 ├── scripts/
 │   ├── build.sh                clone upstream, apply patches, build, collect dist/<size>/
 │   └── build_all.sh            build.sh for every size, optionally zipped for a release,

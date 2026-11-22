@@ -76,7 +76,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 cp "$SRC"/ESPHamClock/wasm/hamclock.* "$OUT"/
 cp "$ROOT"/web/index.html "$ROOT"/web/devserver.py "$OUT"/
-cp "$ROOT"/web/launcher.py "$ROOT/web/HamClock Launcher.command" "$ROOT/web/HamClock Launcher.bat" "$ROOT"/dist/
+cp "$ROOT"/web/launcher.py "$ROOT"/dist/
 if [ "${STRIP:-0}" = 1 ]; then
     "$WASM_OPT" --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext \
         --strip-debug -O2 "$OUT/hamclock.wasm" -o "$OUT/hamclock.wasm"
