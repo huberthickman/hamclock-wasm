@@ -127,6 +127,12 @@ zip and in `dist/` after a build, and needs only Python 3 with tkinter, which th
 python3 launcher.py                    # from the unzipped release, or: python3 dist/launcher.py
 ```
 
+![The launcher on macOS, running the 3200x1920 build against ohb.hamclock.app](docs/screenshots/launcher-macos.png)
+
+*The launcher on macOS, running the 3200x1920 build against ohb.hamclock.app, with one browser
+tab connected. HamClock's own output (`HC:` lines) is interleaved with `devserver.py`'s; "Show
+file requests" is on, so the page's file requests show too.*
+
 On a Mac you can double-click `HamClock Launcher.command` instead. Because it was downloaded,
 macOS may refuse it the first time: allow it under System Settings → Privacy & Security, or use
 the command above.
