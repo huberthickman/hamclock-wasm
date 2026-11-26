@@ -129,7 +129,7 @@ var Module = {
     // persist ~/.hamclock (settings "EEPROM", cached maps) in IndexedDB
     const FS = Module.FS;
     FS.mkdirTree(APPDIR);
-    FS.mount(FS.filesystems.IDBFS, {}, APPDIR);
+    FS.mount(IDBFS, {}, APPDIR);         // not FS.filesystems.IDBFS: Emscripten 6.0.13 removed that
     FS.syncfs(true, (err) => {
       if (err) console.warn('IDBFS load', err);
       status('starting HamClock');

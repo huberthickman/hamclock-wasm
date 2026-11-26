@@ -99,7 +99,8 @@ level. They reach HamClock with their status, as they would natively.
 **Failed requests in Safari and Firefox** (patch 0009). Emscripten counts each fetch on a
 per-thread keepalive counter, and gives the count back from its error handler. When a synchronous
 request fails at the network level, Safari and Firefox both fire the request's `error` event and
-throw from `send()`. Emscripten 3.1.51 handles both, so the count is given back twice. Once the
+throw from `send()`. Emscripten handles both (3.1.51 does, and 7.0.1 still does), so the count is
+given back twice. Once the
 counter would go below zero, a runtime assertion aborts all of HamClock
 (`Aborted(Assertion failed)` from `runtimeKeepalivePop`). Every request fails while
 `devserver.py` is stopped, so stopping it for longer than two HamClock fetches killed the tab in
@@ -414,14 +415,14 @@ before calling `main()`, saves it every 30 s and on `pagehide`. It holds the set
 
 ## What the build produces
 
-`dist/<size>/` holds five files. Only `index.html` and `devserver.py` are written by hand;
-Emscripten generates the other three on every build.
+`dist/<size>/` holds four files, or five with Emscripten 3.1.51. Only `index.html` and
+`devserver.py` are written by hand; Emscripten generates the rest on every build.
 
 | File | Size | What it is |
 |---|---|---|
-| `hamclock.wasm` | 1.7 to 1.9 MB stripped, 9 to 10 MB with `-g` | HamClock itself: all the compiled C++ |
-| `hamclock.js` | about 225 KB (55 KB gzipped) | Emscripten's generated JavaScript "glue", explained below |
-| `hamclock.worker.js` | about 7 KB | Startup script each Web Worker runs first: it loads `hamclock.js` inside the worker and attaches it to the shared memory. Only needed up to Emscripten 3.1.57: from 3.1.58 the worker code is inside `hamclock.js` and this file is an empty placeholder, and from 3.1.68 it isn't generated at all |
+| `hamclock.wasm` | 1.7 to 2.6 MB stripped, 9 to 10 MB with `-g` | HamClock itself: all the compiled C++ |
+| `hamclock.js` | about 300 KB (80 KB gzipped) with 6.0.3 | Emscripten's generated JavaScript "glue", explained below |
+| `hamclock.worker.js` | about 7 KB, 3.1.51 only | Startup script each Web Worker runs first: it loads `hamclock.js` inside the worker and attaches it to the shared memory. Only needed up to Emscripten 3.1.57: from 3.1.58 the worker code is inside `hamclock.js` and this file is an empty placeholder, and from 3.1.68 it isn't generated at all |
 | `index.html` | | The host page: canvas drawing, input, storage setup, configuration |
 | `devserver.py` | | Local server with the COOP/COEP headers and the `/ohb` proxy |
 
@@ -516,9 +517,48 @@ The compile step also gets `-D_WEB_ONLY`, the size's `-D_CLOCK_WxH`, and the thr
 described under [Restarts](#restarts-patch-0006). The Makefile records the size and defines in
 `.wasm-size` and cleans the tree whenever they change, because object files don't record them.
 
-Sizes with Emscripten 3.1.51 and LLVM 18: the wasm is 9 to 10 MB with HamClock's default `-g`.
-After `wasm-opt --strip-debug -O2` it's 1.7 MB (800x480) to 1.9 MB (1600x960), or about
-625 KB gzipped at 800x480. The JavaScript glue is about 225 KB, 55 KB gzipped.
+Sizes with Emscripten 6.0.3: the wasm is 9 to 10 MB with HamClock's default `-g`. After
+`wasm-opt --strip-debug -O2` it's 1.7 MB (800x480), 1.9 MB (1600x960), 2.2 MB (2400x1440) and
+2.6 MB (3200x1920), about 625 KB gzipped at 800x480. The JavaScript glue is about 300 KB, 80 KB
+gzipped. With 3.1.51 the wasm was much the same size and the JavaScript smaller, about 225 KB.
+
+`build.sh` keeps object files between builds, but records the patches' checksum and the first
+line of `emcc --version` in `build/.patch-sum`. When either changes, it removes the Makefile's
+`.wasm-size` stamp, which makes the Makefile clean before building: make tracks neither header
+changes nor the compiler, and objects from another Emscripten version may not link, or worse,
+may link.
+
+## Emscripten versions
+
+The browser build targets **Emscripten 6.0.3**. It was built and tested with 3.1.51 (December
+2023) until November 2026. Findings from building HamClock with later versions:
+
+| Versions | Result |
+|---|---|
+| 3.1.51 | Works. Fully tested, the reference until 6.0.3 |
+| 5.0.7 | Works. Build, relay, stop and restart, notices, tab lock and settings tested |
+| 6.0.1, 6.0.2 | **Avoid.** They pass a request body to the browser as a view onto the wasm memory, which is a `SharedArrayBuffer` in a threaded build, and browsers refuse to send that: every relayed write fails, so the DX Cluster, HamAlert and APRS panes can't log in. Fixed in 6.0.3, which copies the body again |
+| 6.0.3 | Works. **The target.** Everything below tested |
+| 6.0.4 to 6.0.12 | Not built. Need LLVM 24, which only comes with the official SDK. From the changelogs and source, nothing here affects HamClock |
+| 6.0.13 | Not built. Removed `FS.filesystems`, which the page used to mount IDBFS; the page now uses plain `IDBFS`, which works with every version |
+| 7.0.0 and later | Compiled, not linked (LLVM 24 again). libc++ 23 stops including headers indirectly; `passwords.cpp` was the only file affected, fixed by patch 0010 |
+
+In every version checked, from 3.1.51 to 7.0.1, a synchronous request that fails at the network
+level is still reported twice in Safari and Firefox, so patch 0009 stays.
+
+Tested with 6.0.3, in headless Chromium, at every size:
+- all four sizes start and draw at full resolution;
+- settings survive a reload;
+- links open in a new tab after a real click, or through the "click to open" bar without one;
+- the TCP relay: DX Cluster, HamAlert and APRS log in and receive spots;
+- 70 s without `devserver.py`, with Safari-style request failures, then carrying on;
+- the stopped and unreachable notices, the one-tab lock, and reloads;
+- a launcher session: start, stop, switching size (the open tab reloaded at the new size), and
+  quitting while running.
+
+Restarts from inside HamClock weren't driven here (they sit behind HamClock's own menus), but
+use the same polling as links, and `_hc_restart_req` is exported. The build used the released
+LLVM 23.1.6 rather than the snapshot that the 6.0.3 SDK ships, and Chromium only.
 
 ## Sizes
 

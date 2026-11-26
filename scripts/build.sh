@@ -51,13 +51,14 @@ for p in "$ROOT"/patches/*.patch; do
     git -C "$SRC" apply "$p"
 done
 
-# objects from an earlier build are reused only if the patches are unchanged: make doesn't track
-# header changes, so a patch that changes a class layout would otherwise mix old and new objects.
+# objects from an earlier build are reused only if the patches and the compiler are unchanged:
+# make doesn't track header changes, so a patch that changes a class layout would otherwise mix
+# old and new objects, and objects from another Emscripten version may not link (or worse, may).
 # Removing the size stamp makes the Makefile clean before building.
-PATCH_SUM="$(cat "$ROOT"/patches/*.patch | cksum | tr -d ' ')"
-if [ "$(cat "$ROOT/build/.patch-sum" 2>/dev/null)" != "$PATCH_SUM" ]; then
+BUILD_SUM="$(cat "$ROOT"/patches/*.patch | cksum | tr -d ' ') $(emcc --version | sed -n 1p)"
+if [ "$(cat "$ROOT/build/.patch-sum" 2>/dev/null)" != "$BUILD_SUM" ]; then
     rm -f "$SRC/ESPHamClock/.wasm-size"
-    echo "$PATCH_SUM" > "$ROOT/build/.patch-sum"
+    echo "$BUILD_SUM" > "$ROOT/build/.patch-sum"
 fi
 
 # the sub-Makefiles call plain ar/ranlib, which (on macOS) can't index wasm objects.
